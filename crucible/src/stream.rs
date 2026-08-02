@@ -132,7 +132,32 @@ impl Reporter for SessionReporter {
         });
     }
 
-    fn run_agent(&mut self, args: &Args, p: &Paths, it: u32, prompt: &str) -> AgentTurn {
+    fn run_agent(
+        &mut self,
+        args: &Args,
+        p: &Paths,
+        it: u32,
+        prompt: &str,
+        resume_prompt: Option<&str>,
+        session: Option<&str>,
+    ) -> AgentTurn {
+        let prepared = match crate::agent_session::prepare_named(&p.state, session) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return AgentTurn {
+                    cost: 0.0,
+                    is_error: true,
+                    error: Some(error),
+                };
+            }
+        };
+        if let Some(turn) = &prepared {
+            self.emit(&SessionEvent::AgentSession {
+                session: turn.logical_name.clone(),
+                action: turn.action(),
+                turn: turn.completed_turns + 1,
+            });
+        }
         self.emit(&SessionEvent::AgentStart { iter: it });
         // Borrow the sink directly so the closure can append without re-borrowing self.
         let sink = &mut self.sink;
@@ -141,20 +166,37 @@ impl Reporter for SessionReporter {
         // loop can discard a failed turn.
         let mut is_error = false;
         let mut error = None;
-        let cost = agent::run_turn(args, p, prompt, true, |_raw, _stream, ev| {
-            if let Some(ev) = ev {
-                if let AgentEvent::Result {
-                    is_error: e,
-                    error: text,
-                    ..
-                } = ev
-                {
-                    is_error = *e;
-                    error = text.clone();
+        let cost = agent::run_turn_with_session(
+            args,
+            p,
+            crate::agent_session::effective_prompt(prepared.as_ref(), prompt, resume_prompt),
+            true,
+            prepared.as_ref(),
+            |_raw, _stream, ev| {
+                if let Some(ev) = ev {
+                    if let AgentEvent::Result {
+                        is_error: e,
+                        error: text,
+                        ..
+                    } = ev
+                    {
+                        is_error = *e;
+                        error = text.clone();
+                    }
+                    if let AgentEvent::Error { message, .. } = ev {
+                        is_error = true;
+                        error = Some(message.clone());
+                    }
+                    sink.write_event(&SessionEvent::Agent { event: ev.clone() });
                 }
-                sink.write_event(&SessionEvent::Agent { event: ev.clone() });
-            }
-        });
+            },
+        );
+        if let Some(note) =
+            crate::agent_session::commit_if_ok(&p.state, prepared.as_ref(), !is_error)
+        {
+            is_error = true;
+            error = Some(note);
+        }
         self.emit(&SessionEvent::AgentDone);
         AgentTurn {
             cost,

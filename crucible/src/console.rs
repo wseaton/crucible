@@ -45,28 +45,71 @@ impl Reporter for ConsoleReporter {
         }
     }
 
-    fn run_agent(&mut self, args: &Args, p: &Paths, it: u32, prompt: &str) -> AgentTurn {
+    fn run_agent(
+        &mut self,
+        args: &Args,
+        p: &Paths,
+        it: u32,
+        prompt: &str,
+        resume_prompt: Option<&str>,
+        session: Option<&str>,
+    ) -> AgentTurn {
         println!("  -> running agent (iteration {it}, {}) …", args.model);
         // Pretty stream (json=false): echo each line so the human sees the same
         // output as before, while the helper scrapes cost for budgeting and we
         // watch the result event for a failed (is_error) no-op turn.
         let mut is_error = false;
         let mut error = None;
-        let cost = agent::run_turn(args, p, prompt, false, |raw, stream, ev| {
-            if let Some(AgentEvent::Result {
-                is_error: e,
-                error: text,
-                ..
-            }) = ev
-            {
-                is_error = *e;
-                error = text.clone();
+        let prepared = match crate::agent_session::prepare_named(&p.state, session) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return AgentTurn {
+                    cost: 0.0,
+                    is_error: true,
+                    error: Some(error),
+                };
             }
-            match stream {
-                RawStream::Stdout => println!("{}", raw.trim_end()),
-                RawStream::Stderr => eprintln!("{}", raw.trim_end()),
-            }
-        });
+        };
+        if let Some(turn) = &prepared {
+            println!(
+                "  -> agent session {} {} (turn {})",
+                turn.logical_name,
+                turn.action(),
+                turn.completed_turns + 1
+            );
+        }
+        let cost = agent::run_turn_with_session(
+            args,
+            p,
+            crate::agent_session::effective_prompt(prepared.as_ref(), prompt, resume_prompt),
+            false,
+            prepared.as_ref(),
+            |raw, stream, ev| {
+                if let Some(AgentEvent::Result {
+                    is_error: e,
+                    error: text,
+                    ..
+                }) = ev
+                {
+                    is_error = *e;
+                    error = text.clone();
+                }
+                if let Some(AgentEvent::Error { message, .. }) = ev {
+                    is_error = true;
+                    error = Some(message.clone());
+                }
+                match stream {
+                    RawStream::Stdout => println!("{}", raw.trim_end()),
+                    RawStream::Stderr => eprintln!("{}", raw.trim_end()),
+                }
+            },
+        );
+        if let Some(note) =
+            crate::agent_session::commit_if_ok(&p.state, prepared.as_ref(), !is_error)
+        {
+            is_error = true;
+            error = Some(note);
+        }
         AgentTurn {
             cost,
             is_error,

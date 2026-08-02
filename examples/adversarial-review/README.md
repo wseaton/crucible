@@ -11,7 +11,9 @@ engine propose (edit) ───┤                                  ├─> gate
 
 `workflow.star` declares the entire iteration, including proposal, application, frozen measurement,
 and keep/discard as editable task nodes. Crucible still owns the capabilities behind those
-operations and admits the graph under the `autoresearch` workflow contract. The older standalone
+operations and admits the graph under the `autoresearch` workflow contract. Its proposer binds to
+the durable `solver` session, so a discarded checkout rolls back without erasing what the solver
+learned; the isolated reviewers intentionally start fresh. The older standalone
 plan fixtures below exercise the general plan runner with the same tasks:
 
 ```
@@ -61,8 +63,9 @@ This matters in `plan-reward-hack.toml`: its stand-in implementer tries to repla
 crucible plan compile-workflow \
   --file examples/adversarial-review/workflow.star
 
-# The normal autoresearch loop capability-admits the generated workflow graph.
-crucible --manifest examples/adversarial-review/crucible.toml --iterations 1
+# The graph loop capability-admits and executes the generated workflow.
+crucible --manifest examples/adversarial-review/crucible.toml \
+  --graph-loop --iterations 2 --no-early-stop
 
 # The standalone plan-runner fixture remains useful for inspecting the graph itself.
 crucible plan show --file examples/adversarial-review/plan-panel-hack.toml

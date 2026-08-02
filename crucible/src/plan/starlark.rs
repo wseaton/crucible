@@ -292,14 +292,15 @@ impl Compiler {
                     model: take_optional_string(&mut named, "model")?,
                     effort: take_optional_string(&mut named, "effort")?,
                 };
-                dsl_task(&mut named, name, kind)?
+                let session = take_optional_string(&mut named, "session")?;
+                dsl_task(&mut named, name, kind, session)?
             }
             "command" => {
                 let name = TaskName(take_string(&mut named, "name")?);
                 let kind = TaskKind::Command {
                     command: take_string(&mut named, "run")?,
                 };
-                dsl_task(&mut named, name, kind)?
+                dsl_task(&mut named, name, kind, None)?
             }
             "top_k" => {
                 let k = take_int(&mut named, "k")?;
@@ -322,6 +323,7 @@ impl Compiler {
                         direction,
                     },
                     depends_on,
+                    session: None,
                     needs: "any".to_owned(),
                     required: take_bool_default(&mut named, "required", true)?,
                     isolation: None,
@@ -426,19 +428,32 @@ fn engine_task(
     op: EngineOp,
     source: Option<TaskName>,
 ) -> Result<Task> {
-    Ok(engine(
+    let session = if op == EngineOp::Propose {
+        take_optional_string(named, "session")?
+    } else {
+        None
+    };
+    let mut task = engine(
         &take_string(named, "name")?,
         op,
         source,
         take_task_names(named)?,
-    ))
+    );
+    task.session = session;
+    Ok(task)
 }
 
-fn dsl_task(named: &mut BTreeMap<String, Value>, name: TaskName, kind: TaskKind) -> Result<Task> {
+fn dsl_task(
+    named: &mut BTreeMap<String, Value>,
+    name: TaskName,
+    kind: TaskKind,
+    session: Option<String>,
+) -> Result<Task> {
     Ok(Task {
         name,
         task: kind,
         depends_on: take_task_names(named)?,
+        session,
         needs: take_string_default(named, "needs", "any")?,
         required: take_bool_default(named, "required", true)?,
         isolation: isolation(take_bool_default(named, "isolated", false)?),
@@ -451,6 +466,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         name: TaskName(name.to_owned()),
         task: TaskKind::Engine { op, source },
         depends_on,
+        session: None,
         needs: "any".to_owned(),
         required: true,
         isolation: None,
@@ -738,7 +754,7 @@ workflow(reviews + [
     fn compiles_explicit_autoresearch_custom_and_default_workflows() {
         let pack = temp_pack("types");
         let explicit = r#"
-candidate = propose(name = "invent")
+candidate = propose(name = "invent", session = "solver")
 review = command(name = "review", run = "./review.sh", depends_on = [candidate])
 live = apply(name = "deploy", depends_on = [review])
 score = measure(name = "benchmark", depends_on = [live])
@@ -753,6 +769,10 @@ workflow(
         assert_eq!(compiled.workflow.workflow_type, WorkflowType::Autoresearch);
         assert_eq!(compiled.workflow.result, Some("choose".into()));
         assert_eq!(compiled.workflow.tasks[0].name.0, "invent");
+        assert_eq!(
+            compiled.workflow.tasks[0].session.as_deref(),
+            Some("solver")
+        );
 
         let custom = r#"
 publish = command(name = "publish", run = "./publish.sh")
@@ -889,5 +909,21 @@ default_autoresearch([review])
             .collect();
         assert!(strays.is_empty(), "left temp files: {strays:?}");
         let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn counter_smoke_workflow_matches_its_materialized_manifest() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let pack = root.join("examples/counter");
+        let compiled = compile_file(&pack.join("workflow.star"), &pack).unwrap();
+        let manifest = crate::manifest::Manifest::load(&pack.join("crucible.toml")).unwrap();
+        assert_eq!(
+            serde_json::to_value(&compiled.workflow).unwrap(),
+            serde_json::to_value(&manifest.workflow).unwrap()
+        );
+        assert_eq!(
+            compiled.workflow.tasks[0].session.as_deref(),
+            Some("solver")
+        );
     }
 }

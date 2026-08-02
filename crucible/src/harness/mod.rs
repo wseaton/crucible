@@ -107,6 +107,20 @@ impl Harness {
         }
     }
 
+    pub(crate) fn local_session_argv(
+        self,
+        args: &Args,
+        prompt: &str,
+        session: &crate::agent_session::SessionTurn,
+    ) -> std::io::Result<Vec<String>> {
+        match self {
+            Harness::Claude => Ok(claude::local_session_argv(args, prompt, session)),
+            Harness::Hermes => Err(std::io::Error::other(
+                "hermes does not yet expose a Crucible-managed opaque session id",
+            )),
+        }
+    }
+
     /// Harness env defaults for a local spawn, applied before the manifest `[agent].env`
     /// (so a manifest override wins).
     pub(crate) fn local_env_defaults(self) -> &'static [(&'static str, &'static str)] {
@@ -124,6 +138,21 @@ impl Harness {
         match self {
             Harness::Claude => claude::sandbox_argv(args, mcp_seeded),
             Harness::Hermes => hermes::sandbox_argv(args, mcp_seeded),
+        }
+    }
+
+    /// Sandbox counterpart of [`Harness::local_session_argv`].
+    pub(crate) fn sandbox_session_argv(
+        self,
+        args: &Args,
+        mcp_seeded: bool,
+        session: &crate::agent_session::SessionTurn,
+    ) -> std::io::Result<Vec<String>> {
+        match self {
+            Harness::Claude => Ok(claude::sandbox_session_argv(args, mcp_seeded, session)),
+            Harness::Hermes => Err(std::io::Error::other(
+                "hermes does not yet expose a Crucible-managed opaque session id",
+            )),
         }
     }
 

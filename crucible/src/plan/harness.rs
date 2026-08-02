@@ -219,14 +219,33 @@ fn run_in(
 
     let name = task.name.0.clone();
     let mut transport_error: Option<String> = None;
-    let cost = crate::agent::run_turn(&args, paths, &full_prompt, false, |line, stream, ev| {
-        if !line.trim().is_empty() && stream == RawStream::Stderr {
-            eprintln!("[{name}] {line}");
-        }
-        if let Some(note) = ev.and_then(agent_transport_error) {
-            transport_error = Some(note);
-        }
-    });
+    let prepared = match crate::agent_session::prepare_named(&paths.state, task.session.as_deref())
+    {
+        Ok(prepared) => prepared,
+        Err(note) => return transport(note),
+    };
+    let cost = crate::agent::run_turn_with_session(
+        &args,
+        paths,
+        &full_prompt,
+        false,
+        prepared.as_ref(),
+        |line, stream, ev| {
+            if !line.trim().is_empty() && stream == RawStream::Stderr {
+                eprintln!("[{name}] {line}");
+            }
+            if let Some(note) = ev.and_then(agent_transport_error) {
+                transport_error = Some(note);
+            }
+        },
+    );
+    if let Some(note) = crate::agent_session::commit_if_ok(
+        &paths.state,
+        prepared.as_ref(),
+        transport_error.is_none(),
+    ) {
+        transport_error = Some(note);
+    }
 
     match std::fs::read_to_string(&result_path) {
         Ok(body) => {
@@ -429,6 +448,89 @@ mod tests {
                 .trim(),
             "3"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_turn_that_writes_no_result_fails_but_still_advances_the_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-plan-session-quiet-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("quiet.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("quiet.sh"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        std::fs::write(
+            dir.join("crucible.toml"),
+            r#"
+            [repo]
+            path = "."
+            [workspace]
+            dir = "workspace"
+            setup_cmd = "mkdir -p workspace && cp quiet.sh workspace/ && git -C workspace init -q && git -C workspace add -A && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -qm baseline"
+            [agent]
+            backend = "command"
+            agent_cmd = "./quiet.sh"
+            goal = "say nothing"
+            [judge]
+            measure_cmd = "echo 0"
+            direction = "higher"
+            "#,
+        )
+        .unwrap();
+
+        let plan = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 2.0
+            [[task]]
+            name = "quiet"
+            kind = "agent"
+            prompt = "produce nothing"
+            session = "solver"
+            required = false
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let state = runner.paths.state.clone();
+        assert!(
+            !crate::agent_session::prepare(&state, "solver")
+                .unwrap()
+                .is_resume(),
+            "no cursor before the first turn"
+        );
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        let result = &out.results[&"quiet".into()];
+        assert_eq!(result.status, TaskStatus::Fail, "{result:?}");
+        assert!(
+            result
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .contains(RESULT_FILE),
+            "the failure names the missing result file: {result:?}"
+        );
+        let next = crate::agent_session::prepare(&state, "solver").unwrap();
+        assert!(next.is_resume(), "the conversation is resumable: {next:?}");
+        assert_eq!(next.completed_turns, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -644,6 +746,7 @@ mod tests {
                 effort: None,
             },
             depends_on: vec![],
+            session: None,
             needs: "any".into(),
             required: true,
             isolation: None,
