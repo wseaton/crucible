@@ -31,8 +31,7 @@ impl std::fmt::Display for GitFailure {
 
 impl std::error::Error for GitFailure {}
 
-/// The workspace's uncommitted state, captured once for a whole fan-out: one tree scan
-/// instead of N, and every candidate demonstrably starts from the same view.
+/// Capture uncommitted state once for reuse across a fan-out.
 pub(crate) fn snapshot(workspace: &Path) -> Result<String> {
     capture_diff(workspace)
 }
@@ -41,13 +40,13 @@ pub(crate) fn snapshot(workspace: &Path) -> Result<String> {
 /// hard-links objects, so a fan-out of N candidates costs ~one checkout each rather than N
 /// full copies.
 ///
-/// Takes its own snapshot; concurrent callers should share one via [`setup_with`].
+/// Concurrent callers should share a snapshot via [`setup_with`].
 pub(crate) fn setup(workspace: &Path, dest: &Path) -> Result<()> {
     let snapshot = snapshot(workspace).context("capturing the workspace before isolation")?;
     setup_with(workspace, dest, &snapshot)
 }
 
-/// [`setup`] against a snapshot the caller already took.
+/// Create a worktree from a caller-provided snapshot.
 pub(crate) fn setup_with(workspace: &Path, dest: &Path, snapshot: &str) -> Result<()> {
     if dest.exists() {
         std::fs::remove_dir_all(dest)?;
@@ -69,22 +68,16 @@ pub(crate) fn setup_with(workspace: &Path, dest: &Path, snapshot: &str) -> Resul
         .output()
         .context("git checkout HEAD in a task worktree")?;
     require_success("git checkout HEAD", &checkout)?;
-    // A clone only carries committed state, but isolation has to mean "the workspace as it
-    // stands right now": an upstream task's uncommitted edits are exactly what the isolated
-    // task is usually there to look at. Carry the working tree over as a patch.
+    // A clone omits the upstream task's uncommitted state; replay it as a patch.
     apply(dest, snapshot).context("carrying the workspace's uncommitted state into a task worktree")
 }
 
-/// Capture what a task changed (staged, unstaged, untracked). `--binary` so [`apply`] can
-/// replay it losslessly.
-///
-/// `git add -A` runs against a throwaway index seeded from the real one, so this reads
-/// without writing: no `.git/index.lock` contention between concurrent callers, and no
-/// staging the caller's workspace behind its back.
+/// Capture staged, unstaged, and untracked state as a binary patch.
+/// Uses a throwaway index to avoid staging or `.git/index.lock` contention.
 pub(crate) fn capture_diff(worktree: &Path) -> Result<String> {
     let scratch = tempfile::tempdir().context("creating a temporary Git index directory")?;
     let index = scratch.path().join("index");
-    // A repo with no commits yet has no index; starting from an absent one is fine.
+    // An unborn repository has no index.
     let real = git_path(worktree, "index")?;
     match std::fs::copy(&real, &index) {
         Ok(_) => {}
@@ -190,7 +183,6 @@ mod tests {
         );
     }
 
-    /// Capturing must not touch the repo it reads.
     #[test]
     fn capturing_a_diff_leaves_the_repository_alone() {
         let root =
@@ -245,7 +237,6 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).to_string()
     }
 
-    /// One snapshot, many concurrent worktrees, identical uncommitted state in each.
     #[test]
     fn one_snapshot_feeds_concurrent_worktrees_identically() {
         const WORKTREES: usize = 8;

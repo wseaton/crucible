@@ -735,7 +735,7 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
         let wide_dir = self.wide_dir.clone();
         let skills = self.p.skills.clone();
         let args = self.args;
-        // One capture for the round: every candidate starts from the same workspace.
+        // Every candidate starts from one snapshot.
         let snapshot = match crate::plan::worktree::snapshot(&workspace) {
             Ok(snapshot) => snapshot,
             Err(error) => {

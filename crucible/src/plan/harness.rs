@@ -46,7 +46,7 @@ impl TaskRunner for HarnessRunner {
                 &b.inputs,
             )];
         }
-        // One capture for the batch: every worktree sees the same candidate.
+        // Every batch member starts from one snapshot.
         let snapshot = match crate::plan::worktree::snapshot(&self.paths.workspace) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -77,8 +77,8 @@ impl TaskRunner for HarnessRunner {
     }
 }
 
-/// Dispatch one task, in the shared workspace or a private worktree. `None` snapshot means
-/// this task is alone and takes its own.
+/// Dispatch in the shared workspace or a private worktree.
+/// A lone isolated task captures its own snapshot.
 fn run_task(
     args: &Args,
     paths: &Paths,
