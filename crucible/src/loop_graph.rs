@@ -35,6 +35,8 @@ pub(crate) struct IterCtx<'a> {
     pub control: Option<&'a control::ControlState>,
     pub it: u32,
     pub prompt: &'a str,
+    /// Delta-only prompt for a resumed proposer session.
+    pub resume_prompt: &'a str,
     pub rows: &'a [Row],
     pub baseline_score: f64,
     pub baseline_total: u64,
@@ -48,7 +50,11 @@ pub(crate) struct IterCtx<'a> {
 
 /// Run one admitted autoresearch iteration and return its step and cost.
 pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(IterStep, f64)> {
-    let plan = iteration_template(cx.prompt, cx.workflow)?;
+    let mut caps = WorkflowCaps::autoresearch_engine();
+    if agent::supports_persistent_sessions(cx.args) {
+        caps = caps.with_persistent_sessions();
+    }
+    let plan = iteration_template(cx.prompt, cx.workflow, &caps)?;
     let result_task = cx
         .workflow
         .filter(|workflow| !workflow.is_legacy_splice())
@@ -65,6 +71,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         r,
         it: cx.it,
         prompt: cx.prompt,
+        resume_prompt: cx.resume_prompt,
         rows: cx.rows,
         ctx: MeasureCtx {
             baseline_score: Some(cx.baseline_score),
@@ -144,10 +151,14 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
 }
 
 /// Build and admit the default or authored iteration graph.
-fn iteration_template(_prompt: &str, workflow: Option<&WorkflowCfg>) -> Result<ValidPlan> {
+fn iteration_template(
+    _prompt: &str,
+    workflow: Option<&WorkflowCfg>,
+    caps: &WorkflowCaps,
+) -> Result<ValidPlan> {
     if let Some(workflow) = workflow.filter(|workflow| !workflow.is_legacy_splice()) {
         workflow
-            .admit(&WorkflowCaps::autoresearch_engine())
+            .admit(caps)
             .context("admitting authored workflow into the autoresearch loop")?;
         return Plan {
             version: 1,
@@ -165,6 +176,7 @@ fn iteration_template(_prompt: &str, workflow: Option<&WorkflowCfg>) -> Result<V
                 name: name.into(),
                 task: TaskKind::Engine { op, source },
                 depends_on: deps,
+                session: None,
                 needs: "any".to_string(),
                 required: true,
                 isolation: None,
@@ -208,7 +220,7 @@ fn iteration_template(_prompt: &str, workflow: Option<&WorkflowCfg>) -> Result<V
         tasks,
     };
     workflow
-        .admit(&WorkflowCaps::autoresearch_engine())
+        .admit(caps)
         .context("admitting the default autoresearch workflow")?;
     Plan {
         version: 1,
@@ -241,6 +253,7 @@ struct LoopTaskRunner<'a, R: Reporter> {
     r: &'a mut R,
     it: u32,
     prompt: &'a str,
+    resume_prompt: &'a str,
     rows: &'a [Row],
     ctx: MeasureCtx,
     best_score: f64,
@@ -254,8 +267,15 @@ struct LoopTaskRunner<'a, R: Reporter> {
 }
 
 impl<R: Reporter> LoopTaskRunner<'_, R> {
-    fn propose(&mut self, prompt: &str) -> Attempt {
-        let turn = self.r.run_agent(self.args, self.p, self.it, prompt);
+    fn propose(&mut self, task: &Task, prompt: &str) -> Attempt {
+        let turn = self.r.run_agent(
+            self.args,
+            self.p,
+            self.it,
+            prompt,
+            Some(self.resume_prompt),
+            task.session.as_deref(),
+        );
         let cost = turn.cost;
         if let Some(control) = self.control {
             control.set_spend(self.spent_before + cost);
@@ -357,7 +377,7 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
             TaskKind::Engine {
                 op: EngineOp::Propose,
                 ..
-            } => self.propose(self.prompt),
+            } => self.propose(task, self.prompt),
             TaskKind::Engine {
                 op: EngineOp::Apply,
                 ..
@@ -591,6 +611,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
                 effort: None,
             },
             depends_on: vec![],
+            session: None,
             needs: "any".to_string(),
             required: false,
             isolation: Some(Isolation::Worktree),
@@ -605,6 +626,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
                 source: None,
             },
             depends_on: vec![TaskName(format!("propose-{id}"))],
+            session: None,
             needs: "any".to_string(),
             required: false,
             isolation: None,
@@ -620,6 +642,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         depends_on: (0..cfg.n)
             .map(|id| TaskName(format!("measure-{id}")))
             .collect(),
+        session: None,
         needs: "any".to_string(),
         required: false,
         isolation: None,
@@ -926,7 +949,8 @@ mod tests {
         )
         .unwrap();
         w.validate().unwrap();
-        let plan = iteration_template("go", Some(&w)).unwrap();
+        let plan =
+            iteration_template("go", Some(&w), &WorkflowCaps::autoresearch_engine()).unwrap();
         let names: Vec<&str> = plan.tasks_topo().map(|t| t.name.0.as_str()).collect();
         assert_eq!(
             names,
@@ -992,7 +1016,7 @@ mod tests {
 
     #[test]
     fn template_is_the_canonical_chain() {
-        let plan = iteration_template("go", None).unwrap();
+        let plan = iteration_template("go", None, &WorkflowCaps::autoresearch_engine()).unwrap();
         let names: Vec<&str> = plan.tasks_topo().map(|t| t.name.0.as_str()).collect();
         assert_eq!(names, ["propose", "apply", "measure", "decide"]);
         assert!(plan.tasks_topo().all(|t| t.required));
@@ -1020,7 +1044,12 @@ mod tests {
              [[task]]\nname = \"keep-if-better\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"benchmark-a\"\ndepends_on = [\"benchmark-a\", \"explain-score\"]\n",
         )
         .unwrap();
-        let plan = iteration_template("dynamic prompt", Some(&workflow)).unwrap();
+        let plan = iteration_template(
+            "dynamic prompt",
+            Some(&workflow),
+            &WorkflowCaps::autoresearch_engine(),
+        )
+        .unwrap();
         let names: Vec<&str> = plan.tasks_topo().map(|task| task.name.0.as_str()).collect();
         assert_eq!(
             names,
