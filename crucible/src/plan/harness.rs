@@ -28,7 +28,7 @@ pub struct HarnessRunner {
 
 impl TaskRunner for HarnessRunner {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
-        run_task(&self.args, &self.paths, task, attempt, inputs)
+        run_task(&self.args, &self.paths, None, task, attempt, inputs)
     }
 
     /// Isolated tasks that are ready together run concurrently, each in its own worktree.
@@ -40,18 +40,24 @@ impl TaskRunner for HarnessRunner {
             return vec![run_task(
                 &self.args,
                 &self.paths,
+                None,
                 b.task,
                 b.attempt,
                 &b.inputs,
             )];
         }
+        // One capture for the batch: every worktree sees the same candidate.
+        let snapshot = crate::plan::worktree::snapshot(&self.paths.workspace);
         std::thread::scope(|scope| {
             let handles: Vec<_> = batch
                 .iter()
                 .map(|b| {
                     let args = self.args.clone();
                     let paths = self.paths.clone();
-                    scope.spawn(move || run_task(&args, &paths, b.task, b.attempt, &b.inputs))
+                    let snapshot = snapshot.as_str();
+                    scope.spawn(move || {
+                        run_task(&args, &paths, Some(snapshot), b.task, b.attempt, &b.inputs)
+                    })
                 })
                 .collect();
             handles
@@ -65,10 +71,12 @@ impl TaskRunner for HarnessRunner {
     }
 }
 
-/// Dispatch one task, in the shared workspace or in a private worktree.
+/// Dispatch one task, in the shared workspace or a private worktree. `None` snapshot means
+/// this task is alone and takes its own.
 fn run_task(
     args: &Args,
     paths: &Paths,
+    snapshot: Option<&str>,
     task: &Task,
     attempt: u32,
     inputs: &BTreeMap<TaskName, Value>,
@@ -90,7 +98,11 @@ fn run_task(
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     let worktree = root.join(slug);
-    if let Err(e) = crate::plan::worktree::setup(&paths.workspace, &worktree) {
+    let prepared = match snapshot {
+        Some(snapshot) => crate::plan::worktree::setup_with(&paths.workspace, &worktree, snapshot),
+        None => crate::plan::worktree::setup(&paths.workspace, &worktree),
+    };
+    if let Err(e) = prepared {
         return fail(0.0, format!("worktree setup failed: {e:#}"));
     }
     let iso = Paths {
