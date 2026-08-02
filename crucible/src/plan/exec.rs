@@ -170,9 +170,7 @@ pub fn execute(
                 .depends_on
                 .iter()
                 .all(|d| runnable.get(d).copied().unwrap_or(false)),
-            // A lossy join is specifically allowed to run without advisory branches that
-            // this substrate cannot provide, but at least one branch must remain. Required
-            // dependencies independently trigger the fail-closed check below.
+            // A lossy join remains runnable if any dependency can run.
             Join::Passed => t
                 .depends_on
                 .iter()
@@ -255,8 +253,7 @@ pub fn execute(
                     .depends_on
                     .iter()
                     .all(|d| results.get(d).map(|r| r.status) == Some(TaskStatus::Pass)),
-                // Lossy join: dispatch over the non-empty set that passed (a Fail dep just
-                // contributes no input; the inputs collection below filters outputs).
+                // Only passing outputs feed a lossy join.
                 Join::Passed => t
                     .depends_on
                     .iter()
