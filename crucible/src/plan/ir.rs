@@ -39,6 +39,8 @@ pub enum EngineOp {
     Apply,
     /// `Judge::measure`: score the live candidate.
     Measure,
+    /// Fold evaluation evidence into a measurement; `source` supplies its score.
+    Grade,
     /// `Judge::decide`: rule keep/discard against the run's best.
     Decide,
     /// The wide tournament's scoring stage: apply an upstream candidate diff to the main
@@ -92,6 +94,14 @@ pub enum TaskKind {
     },
     /// A plan-authored command. Trusted scripts require frozen manifest injects.
     Command { command: String },
+    /// A command whose final JSON object is graded by `pass` or a threshold.
+    Evaluate {
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        threshold: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction: Option<Direction>,
+    },
     /// Engine-builtin deterministic fold: keep the k best upstream outputs by `score`.
     TopK { k: u32, direction: Direction },
     /// A capability-owned engine operation.
@@ -109,6 +119,7 @@ impl TaskKind {
         match self {
             TaskKind::Agent { .. } => "agent",
             TaskKind::Command { .. } => "command",
+            TaskKind::Evaluate { .. } => "evaluate",
             TaskKind::TopK { .. } => "top_k",
             TaskKind::Engine {
                 op: EngineOp::Propose,
@@ -122,6 +133,10 @@ impl TaskKind {
                 op: EngineOp::Measure,
                 ..
             } => "engine_measure",
+            TaskKind::Engine {
+                op: EngineOp::Grade,
+                ..
+            } => "engine_grade",
             TaskKind::Engine {
                 op: EngineOp::Decide,
                 ..
@@ -258,6 +273,12 @@ impl Plan {
                     bail!("task {:?} lists dependency {:?} twice", t.name.0, d.0);
                 }
             }
+            if t.join == Join::Passed && t.depends_on.is_empty() {
+                bail!(
+                    "task {:?}: join = \"passed\" needs at least one dependency",
+                    t.name.0
+                );
+            }
             if let TaskKind::TopK { k, .. } = &t.task {
                 if *k == 0 {
                     bail!("task {:?}: top_k k must be >= 1", t.name.0);
@@ -267,6 +288,22 @@ impl Plan {
                         "task {:?}: top_k needs at least one dependency to fold",
                         t.name.0
                     );
+                }
+            }
+            if let TaskKind::Evaluate {
+                threshold,
+                direction,
+                ..
+            } = &t.task
+            {
+                if threshold.is_some() != direction.is_some() {
+                    bail!(
+                        "task {:?}: evaluate threshold and direction must be set together",
+                        t.name.0
+                    );
+                }
+                if threshold.is_some_and(|value| !value.is_finite()) {
+                    bail!("task {:?}: evaluate threshold must be finite", t.name.0);
                 }
             }
             if let Some(session) = &t.session {

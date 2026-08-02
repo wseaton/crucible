@@ -13,7 +13,7 @@ use std::process::Command;
 use serde_json::Value;
 
 use crate::plan::exec::{Attempt, AttemptOutcome, TaskRunner};
-use crate::plan::ir::{Task, TaskKind, TaskName};
+use crate::plan::ir::{Direction, Task, TaskKind, TaskName};
 
 pub struct ShellRunner {
     pub workdir: PathBuf,
@@ -33,6 +33,27 @@ impl TaskRunner for ShellRunner {
                 task.name
             ));
         }
+        self.run_in_workdir(task, inputs)
+    }
+}
+
+impl ShellRunner {
+    /// Run in a worktree prepared by the outer runner without clearing its isolation marker.
+    pub(crate) fn run_in_prepared_worktree(
+        &mut self,
+        task: &Task,
+        inputs: &BTreeMap<TaskName, Value>,
+    ) -> Attempt {
+        if task.isolation != Some(crate::plan::ir::Isolation::Worktree) {
+            return fail(format!(
+                "task {} was not declared for worktree isolation",
+                task.name
+            ));
+        }
+        self.run_in_workdir(task, inputs)
+    }
+
+    fn run_in_workdir(&mut self, task: &Task, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
         cmd.env("CRUCIBLE_TASK", &task.name.0);
@@ -45,7 +66,7 @@ impl TaskRunner for ShellRunner {
             }
         }
         match &task.task {
-            TaskKind::Command { command } => {
+            TaskKind::Command { command } | TaskKind::Evaluate { command, .. } => {
                 cmd.arg(command);
             }
             TaskKind::Agent {
@@ -104,15 +125,63 @@ impl TaskRunner for ShellRunner {
             return fail("no output: expected a JSON result on the last stdout line".to_string());
         };
         match serde_json::from_str::<Value>(last.trim()) {
-            Ok(v) => Attempt {
-                outcome: AttemptOutcome::Pass(v),
-                cost_usd: 0.0,
-            },
+            Ok(v) => evaluation_attempt(task, v),
             Err(e) => fail(format!(
                 "last stdout line is not JSON ({e}): {}",
                 last.trim()
             )),
         }
+    }
+}
+
+fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
+    let TaskKind::Evaluate {
+        threshold,
+        direction,
+        ..
+    } = task.task
+    else {
+        return Attempt {
+            outcome: AttemptOutcome::Pass(value),
+            cost_usd: 0.0,
+        };
+    };
+    let Some(object) = value.as_object_mut() else {
+        return fail("evaluate result must be a JSON object".to_string());
+    };
+    // `pass` may narrow a threshold gate, never widen it.
+    let within_threshold = match (threshold, direction) {
+        (Some(threshold), Some(Direction::Lower)) => object
+            .get("score")
+            .and_then(Value::as_f64)
+            .is_some_and(|score| score <= threshold),
+        (Some(threshold), Some(Direction::Higher)) => object
+            .get("score")
+            .and_then(Value::as_f64)
+            .is_some_and(|score| score >= threshold),
+        (None, None) => true,
+        _ => false,
+    };
+    let declared_pass = match object.get("pass") {
+        None => true,
+        Some(Value::Bool(passed)) => *passed,
+        Some(_) => return fail("evaluate result `pass` must be a boolean".to_string()),
+    };
+    let passed = within_threshold && declared_pass;
+    object.insert("pass".to_string(), Value::Bool(passed));
+    if passed {
+        Attempt {
+            outcome: AttemptOutcome::Pass(value),
+            cost_usd: 0.0,
+        }
+    } else {
+        fail(format!(
+            "evaluation {} did not pass{}",
+            task.name,
+            threshold
+                .map(|threshold| format!(" threshold {threshold}"))
+                .unwrap_or_default()
+        ))
     }
 }
 
@@ -211,6 +280,116 @@ mod tests {
         let r = &out.results[&"chatty".into()];
         assert_eq!(r.status, TaskStatus::Fail);
         assert!(r.note.as_ref().unwrap().contains("not JSON"));
+    }
+
+    #[test]
+    fn evaluate_enforces_threshold_and_normalizes_pass() {
+        let evaluate = |name: &str, score: f64| Task {
+            name: name.into(),
+            task: TaskKind::Evaluate {
+                command: format!("echo '{{\"score\": {score}}}'"),
+                threshold: Some(10.0),
+                direction: Some(Direction::Lower),
+            },
+            depends_on: vec![],
+            session: None,
+            needs: "any".into(),
+            required: true,
+            isolation: None,
+            join: Join::All,
+        };
+        let passed = run_plan(vec![evaluate("latency", 9.5)], None);
+        assert_eq!(passed.results[&"latency".into()].status, TaskStatus::Pass);
+        assert_eq!(
+            passed.results[&"latency".into()].output.as_ref().unwrap()["pass"],
+            true
+        );
+        let failed = run_plan(vec![evaluate("latency", 10.5)], None);
+        assert_eq!(failed.results[&"latency".into()].status, TaskStatus::Fail);
+    }
+
+    #[test]
+    fn explicit_pass_narrows_a_threshold_but_cannot_widen_it() {
+        let evaluate = |name: &str, output: &str| Task {
+            name: name.into(),
+            task: TaskKind::Evaluate {
+                command: format!("echo '{output}'"),
+                threshold: Some(1.0),
+                direction: Some(Direction::Lower),
+            },
+            depends_on: vec![],
+            session: None,
+            needs: "any".into(),
+            required: false,
+            isolation: None,
+            join: Join::All,
+        };
+        let over = run_plan(
+            vec![evaluate("over", r#"{"score": 100, "pass": true}"#)],
+            None,
+        );
+        assert_eq!(over.results[&"over".into()].status, TaskStatus::Fail);
+        let objected = run_plan(
+            vec![evaluate("objected", r#"{"score": 0.5, "pass": false}"#)],
+            None,
+        );
+        assert_eq!(
+            objected.results[&"objected".into()].status,
+            TaskStatus::Fail
+        );
+        let ok = run_plan(vec![evaluate("ok", r#"{"score": 0.5}"#)], None);
+        assert_eq!(ok.results[&"ok".into()].status, TaskStatus::Pass);
+    }
+
+    #[test]
+    fn an_unthresholded_evaluation_is_decided_by_its_script() {
+        let evaluate = |name: &str, output: &str| Task {
+            name: name.into(),
+            task: TaskKind::Evaluate {
+                command: format!("echo '{output}'"),
+                threshold: None,
+                direction: None,
+            },
+            depends_on: vec![],
+            session: None,
+            needs: "any".into(),
+            required: false,
+            isolation: None,
+            join: Join::All,
+        };
+        let green = run_plan(vec![evaluate("green", r#"{"pass": true}"#)], None);
+        assert_eq!(green.results[&"green".into()].status, TaskStatus::Pass);
+        let red = run_plan(vec![evaluate("red", r#"{"pass": false}"#)], None);
+        assert_eq!(red.results[&"red".into()].status, TaskStatus::Fail);
+    }
+
+    #[test]
+    fn malformed_evaluation_pass_fails_closed() {
+        let task = Task {
+            name: "malformed".into(),
+            task: TaskKind::Evaluate {
+                command: r#"echo '{"pass": "false"}'"#.into(),
+                threshold: None,
+                direction: None,
+            },
+            depends_on: vec![],
+            session: None,
+            needs: "any".into(),
+            required: false,
+            isolation: None,
+            join: Join::All,
+        };
+        let out = run_plan(vec![task], None);
+        let result = &out.results[&"malformed".into()];
+        assert_eq!(result.status, TaskStatus::Fail);
+        assert!(
+            result
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("boolean"),
+            "failure explains the contract: {result:?}"
+        );
     }
 
     #[test]

@@ -69,9 +69,10 @@ depends_on = ["measure"]
 | Kind | What it runs |
 | --- | --- |
 | `agent` | One agent turn. `harness` / `model` / `effort` override the manifest's `[agent]` defaults per task; `session` opts into durable continuation. |
-| `command` | A plan-authored command, with the same output contract as `measure_cmd`. |
+| `command` | A plan-authored command returning JSON on its last stdout line. |
+| `evaluate` | A measurement command. `pass = false` vetoes; paired `threshold` + `direction` grade numeric `score`. |
 | `top_k` | Engine-owned reducer: keep the `k` best inputs by their `score` field. Needs at least one dependency. |
-| `engine` | Capability-owned operation (`propose`, `apply`, `measure`, `decide`, or `measure_diff`). Only an admitting orchestrator can execute it. |
+| `engine` | Capability-owned operation (`propose`, `apply`, `measure`, `grade`, `decide`, or `measure_diff`). Only an admitting orchestrator can execute it. |
 
 Serialization is not authority. A workflow may author and sequence engine nodes, but admission
 requires matching capabilities such as `workflow.autoresearch`, `engine.apply`, and
@@ -103,6 +104,9 @@ A task's output is JSON and becomes its dependents' input.
   spawn, harness, or stream error is a transport failure and follows the retry policy.
 - `agent` under `--agent-cmd`: the stand-in receives `CRUCIBLE_PROMPT`, `CRUCIBLE_HARNESS`,
   `CRUCIBLE_MODEL`, `CRUCIBLE_EFFORT`, and returns JSON on its last stdout line.
+- `evaluate`: requires a JSON object. `pass = false` fails and malformed `pass` fails closed.
+  Paired `threshold` and `direction` compare numeric `score` (`lower` is `<=`; `higher` is `>=`).
+  Without a threshold, a successful command passes unless `pass` is false.
 
 `top_k` reads a finite numeric `score` from each input, so an upstream task that wants to rank
 must emit one.
@@ -148,9 +152,8 @@ workspace.
 
 ### `join`
 
-`join = "all"` (default) requires every dependency to pass. `join = "passed"` dispatches once
-every dependency is terminal and folds only the ones that passed. Use it for a reducer over a
-lossy fan-out, or for a gate over reviewers where one being advisory must not stop the run.
+`join = "all"` (default) requires every dependency to pass. `join = "passed"` waits for every
+dependency, then folds the non-empty passing set. It fails closed if none can run or pass.
 
 ## The loop as a plan
 
@@ -214,6 +217,61 @@ from `[search]` on both paths.
 
 The templates carry no budget of their own: the run budget is the driver's, checked between
 rounds, so a turn that overruns the cap is still measured and decided.
+
+### Authored measurement subgraphs
+
+The compatible `measure()` path remains available. For visible measurement, use `evaluate()` and
+`grade()`: dependencies define rungs, isolated peers can run concurrently, and `grade()` selects
+the score source for `decide()`.
+
+```python
+candidate = propose(name = "invent")
+live = apply(name = "deploy", depends_on = [candidate])
+
+refcheck = evaluate(
+    name = "cpu-reference",
+    run = "./refcheck.sh",
+    depends_on = [live],
+)
+diff = evaluate(
+    name = "single-gpu-diff",
+    run = "./diff.sh",
+    depends_on = [refcheck],
+    threshold = 0.001,
+    direction = "lower",
+    needs = "gpu",
+    isolated = True,
+)
+latency = evaluate(
+    name = "latency",
+    run = "./latency.sh",
+    depends_on = [diff],
+    direction = "lower",
+    threshold = 12.5,
+    isolated = True,
+)
+racecheck = evaluate(
+    name = "racecheck",
+    run = "./racecheck.sh",
+    depends_on = [diff],
+    required = False,
+    isolated = True,
+)
+measurement = grade(
+    name = "final-grade",
+    evidence = [diff, latency, racecheck],
+    score = latency,
+)
+decision = decide(name = "choose", measurement = measurement)
+workflow(
+    type = "autoresearch",
+    tasks = [candidate, live, refcheck, diff, latency, racecheck, measurement, decision],
+    result = decision,
+)
+```
+
+The renderer groups `evaluate` and `grade` as **Measurement** while preserving edges. During
+`crucible scope`, validation writes the admitted graph to `WORKFLOW.png`; agents cannot replace it.
 
 Default off while it soaks.
 

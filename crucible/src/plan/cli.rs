@@ -6,7 +6,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::plan::ir::{Plan, TaskKind, ValidPlan};
+use crate::plan::ir::{Direction, Plan, TaskKind, ValidPlan};
+use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked};
+
+const MERMAID_COMMAND_PREVIEW_CHARS: usize = 72;
 
 /// Compile scope-time workflow authoring syntax. JSON on stdout is stable enough for a
 /// checked-in golden; `--manifest` additionally materializes the runtime TOML authority.
@@ -56,8 +59,15 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
     }
     let mut runnable: BTreeSet<&str> = BTreeSet::new();
     for t in plan.tasks_topo() {
-        let ok = (t.needs == "any" || caps.contains(&t.needs))
-            && t.depends_on.iter().all(|d| runnable.contains(d.0.as_str()));
+        let deps_runnable = match t.join {
+            crate::plan::ir::Join::All => {
+                t.depends_on.iter().all(|d| runnable.contains(d.0.as_str()))
+            }
+            crate::plan::ir::Join::Passed => {
+                t.depends_on.iter().any(|d| runnable.contains(d.0.as_str()))
+            }
+        };
+        let ok = (t.needs == "any" || caps.contains(&t.needs)) && deps_runnable;
         if ok {
             runnable.insert(&t.name.0);
         }
@@ -77,6 +87,17 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
                 model.as_deref().unwrap_or("default")
             ),
             TaskKind::Command { command } => format!("command[{command}]"),
+            TaskKind::Evaluate {
+                command,
+                threshold,
+                direction,
+            } => format!(
+                "evaluate[{command}]{}",
+                threshold
+                    .zip(*direction)
+                    .map(|(value, direction)| format!(" {direction:?} {value}"))
+                    .unwrap_or_default()
+            ),
             TaskKind::TopK { k, .. } => format!("top_k[k={k}]"),
             TaskKind::Engine { .. } => t.task.label().to_string(),
         };
@@ -109,9 +130,17 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
 }
 
 /// Fill and text color per task kind, shared by both styling forms.
-const CLASS_STYLES: [(&str, &str); 4] = [
+const CLASS_STYLES: [(&str, &str); 6] = [
     ("agent", "fill:#458588,color:#fbf1c7"),
     ("command", "fill:#98971a,color:#282828"),
+    (
+        "evaluate",
+        "fill:#076678,color:#fbf1c7,stroke:#83a598,stroke-width:2px",
+    ),
+    (
+        "grade",
+        "fill:#d65d0e,color:#fbf1c7,stroke:#fe8019,stroke-width:3px",
+    ),
     ("reduce", "fill:#d79921,color:#282828"),
     ("engine", "fill:#b16286,color:#fbf1c7"),
 ];
@@ -126,13 +155,26 @@ enum Styling {
     PerNode,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Metadata {
+    /// Omit task commands from pasteable Mermaid.
+    Public,
+    /// Include bounded command summaries in previews.
+    Preview,
+}
+
 /// Render the compiled plan as mermaid flowchart source: pipeable into a terminal mermaid
 /// renderer, pasteable into GitHub markdown, and the same source a UI graph view consumes.
 pub fn render_mermaid(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
-    render_mermaid_styled(plan, caps, Styling::ClassDef)
+    render_mermaid_styled(plan, caps, Styling::ClassDef, Metadata::Public)
 }
 
-fn render_mermaid_styled(plan: &ValidPlan, caps: &BTreeSet<String>, styling: Styling) -> String {
+fn render_mermaid_styled(
+    plan: &ValidPlan,
+    caps: &BTreeSet<String>,
+    styling: Styling,
+    metadata: Metadata,
+) -> String {
     let mut runnable: BTreeSet<&str> = BTreeSet::new();
     let mut out = String::from("flowchart TD\n");
     let mut styles = String::new();
@@ -141,16 +183,31 @@ fn render_mermaid_styled(plan: &ValidPlan, caps: &BTreeSet<String>, styling: Sty
         .enumerate()
         .map(|(i, t)| (t.name.clone(), format!("t{i}")))
         .collect();
+    let mut regular_nodes = Vec::new();
+    let mut measurement_nodes = Vec::new();
+    let mut edges = Vec::new();
     for t in plan.tasks_topo() {
-        let ok = (t.needs == "any" || caps.contains(&t.needs))
-            && t.depends_on.iter().all(|d| runnable.contains(d.0.as_str()));
+        let deps_runnable = match t.join {
+            crate::plan::ir::Join::All => {
+                t.depends_on.iter().all(|d| runnable.contains(d.0.as_str()))
+            }
+            crate::plan::ir::Join::Passed => {
+                t.depends_on.iter().any(|d| runnable.contains(d.0.as_str()))
+            }
+        };
+        let ok = (t.needs == "any" || caps.contains(&t.needs)) && deps_runnable;
         if ok {
             runnable.insert(&t.name.0);
         }
         let (shape_open, shape_close, class) = match &t.task {
             TaskKind::Agent { .. } => ("([", "])", "agent"),
             TaskKind::Command { .. } => ("[", "]", "command"),
+            TaskKind::Evaluate { .. } => ("([", "])", "evaluate"),
             TaskKind::TopK { .. } => ("{{", "}}", "reduce"),
+            TaskKind::Engine {
+                op: crate::plan::ir::EngineOp::Grade,
+                ..
+            } => ("{{", "}}", "grade"),
             TaskKind::Engine { .. } => ("[[", "]]", "engine"),
         };
         let mut detail = match &t.task {
@@ -159,7 +216,27 @@ fn render_mermaid_styled(plan: &ValidPlan, caps: &BTreeSet<String>, styling: Sty
                 mermaid_label(harness.as_deref().unwrap_or("default")),
                 mermaid_label(model.as_deref().unwrap_or("default"))
             ),
-            TaskKind::Command { .. } | TaskKind::Engine { .. } => String::new(),
+            TaskKind::Command { command } if metadata == Metadata::Preview => {
+                format!("<br/>run: {}", mermaid_command_preview(command))
+            }
+            TaskKind::Evaluate {
+                command,
+                threshold,
+                direction,
+            } if metadata == Metadata::Preview => {
+                let mut detail = format!("<br/>run: {}", mermaid_command_preview(command));
+                if let (Some(threshold), Some(direction)) = (threshold, direction) {
+                    let comparison = match direction {
+                        Direction::Lower => "&lt;=",
+                        Direction::Higher => "&gt;=",
+                    };
+                    detail.push_str(&format!("<br/>pass: score {comparison} {threshold}"));
+                }
+                detail
+            }
+            TaskKind::Command { .. } | TaskKind::Evaluate { .. } | TaskKind::Engine { .. } => {
+                String::new()
+            }
             TaskKind::TopK { k, .. } => format!("<br/>k={k}"),
         };
         if let Some(session) = &t.session {
@@ -175,18 +252,44 @@ fn render_mermaid_styled(plan: &ValidPlan, caps: &BTreeSet<String>, styling: Sty
             Styling::ClassDef => format!(":::{class}"),
             Styling::PerNode => String::new(),
         };
-        out.push_str(&format!(
+        let node = format!(
             "    {id}{shape_open}\"{name}{detail}{marks}\"{shape_close}{class_suffix}\n",
             name = mermaid_label(&t.name.0),
-        ));
+        );
         if styling == Styling::PerNode
             && let Some((_, props)) = CLASS_STYLES.iter().find(|(name, _)| *name == class)
         {
             styles.push_str(&format!("    style {id} {props}\n"));
         }
-        for d in &t.depends_on {
-            out.push_str(&format!("    {} --> {}\n", ids[d], ids[&t.name]));
+        if matches!(
+            t.task,
+            TaskKind::Evaluate { .. }
+                | TaskKind::Engine {
+                    op: crate::plan::ir::EngineOp::Grade,
+                    ..
+                }
+        ) {
+            measurement_nodes.push(node);
+        } else {
+            regular_nodes.push(node);
         }
+        for d in &t.depends_on {
+            edges.push(format!("    {} --> {}\n", ids[d], ids[&t.name]));
+        }
+    }
+    for node in regular_nodes {
+        out.push_str(&node);
+    }
+    if !measurement_nodes.is_empty() {
+        out.push_str("    subgraph measurement[\"Measurement\"]\n        direction TD\n");
+        for node in measurement_nodes {
+            out.push_str("    ");
+            out.push_str(&node);
+        }
+        out.push_str("    end\n");
+    }
+    for edge in edges {
+        out.push_str(&edge);
     }
     match styling {
         Styling::ClassDef => {
@@ -255,6 +358,16 @@ fn mermaid_label(name: &str) -> String {
         .replace(['\r', '\n'], " ")
 }
 
+fn mermaid_command_preview(command: &str) -> String {
+    let compact = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let mut preview: String = chars.by_ref().take(MERMAID_COMMAND_PREVIEW_CHARS).collect();
+    if chars.next().is_some() {
+        preview.push('…');
+    }
+    mermaid_label(&preview)
+}
+
 pub fn show(path: &Path, caps: &BTreeSet<String>, mermaid: bool, render_img: bool) -> Result<()> {
     let plan = load(path)?;
     if render_img {
@@ -290,16 +403,7 @@ config:
 /// Render the plan's mermaid to PNG (offline, vendored engine) and display it inline when
 /// the terminal speaks an image protocol; otherwise write `<plan>.png` next to the file.
 fn show_rendered(path: &Path, plan: &ValidPlan, caps: &BTreeSet<String>) -> Result<()> {
-    use xai_grok_mermaid::{
-        MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked,
-    };
-
     const THEME: MermaidTheme = MermaidTheme::Dark;
-    let src = format!(
-        "{PREVIEW_LAYOUT_FRONTMATTER}{}",
-        render_mermaid_styled(plan, caps, Styling::PerNode)
-    );
-    let engine = default_engine();
     let inline = crate::plan::term_img::detect().zip(crate::plan::term_img::geometry());
 
     // Match diagram text to terminal glyphs; let deep graphs scroll.
@@ -313,8 +417,7 @@ fn show_rendered(path: &Path, plan: &ValidPlan, caps: &BTreeSet<String>) -> Resu
         },
         None => RenderParams::for_os_viewer(THEME, 1600, 0),
     };
-    let diagram = render_checked(engine.as_ref(), &src, &params, &RenderLimits::default())
-        .map_err(|e| anyhow::anyhow!("mermaid render failed: {e}"))?;
+    let diagram = render_png(plan, caps, &params)?;
 
     match inline {
         Some((proto, geo)) => {
@@ -338,6 +441,38 @@ fn show_rendered(path: &Path, plan: &ValidPlan, caps: &BTreeSet<String>) -> Resu
         }
     }
     Ok(())
+}
+
+/// Rasterize with per-node styles supported by the vendored engine.
+fn render_png(
+    plan: &ValidPlan,
+    caps: &BTreeSet<String>,
+    params: &RenderParams,
+) -> Result<xai_grok_mermaid::RenderedDiagram> {
+    let src = format!(
+        "{PREVIEW_LAYOUT_FRONTMATTER}{}",
+        render_mermaid_styled(plan, caps, Styling::PerNode, Metadata::Preview)
+    );
+    render_checked(
+        default_engine().as_ref(),
+        &src,
+        params,
+        &RenderLimits::default(),
+    )
+    .map_err(|e| anyhow::anyhow!("mermaid render failed: {e}"))
+}
+
+/// Render a validated graph to PNG.
+pub fn render_png_to(
+    plan: &ValidPlan,
+    caps: &BTreeSet<String>,
+    output: &Path,
+) -> Result<(u32, u32)> {
+    let params = RenderParams::for_os_viewer(MermaidTheme::Dark, 1600, 0);
+    let diagram = render_png(plan, caps, &params)?;
+    std::fs::write(output, &diagram.png)
+        .with_context(|| format!("writing workflow graph {}", output.display()))?;
+    Ok((diagram.width_px, diagram.height_px))
 }
 
 /// Compile and execute a plan: real subprocesses, real outputs, the executor's real
@@ -504,6 +639,7 @@ mod tests {
         let out = render_mermaid(&plan, &BTreeSet::new());
         assert!(out.contains("t0[\"review/a\"]"));
         assert!(out.contains("t1[\"review-a\"]"));
+        assert!(!out.contains("run:"), "public source omits commands: {out}");
     }
 
     #[test]
@@ -521,7 +657,8 @@ mod tests {
     #[test]
     fn per_node_styling_drops_the_suffix_the_preview_engine_cannot_parse() {
         let plan = Plan::from_toml_str(SRC).unwrap().validate().unwrap();
-        let out = render_mermaid_styled(&plan, &BTreeSet::new(), Styling::PerNode);
+        let out =
+            render_mermaid_styled(&plan, &BTreeSet::new(), Styling::PerNode, Metadata::Preview);
         assert!(!out.contains(":::"), "no class suffix: {out}");
         assert!(!out.contains("classDef"), "no classDef trailer: {out}");
         assert!(out.contains(r#"t0(["propose"#), "label survives: {out}");
@@ -549,9 +686,95 @@ mod tests {
             strip(render_mermaid_styled(
                 &plan,
                 &BTreeSet::new(),
-                Styling::PerNode
+                Styling::PerNode,
+                Metadata::Public,
             ))
         );
+    }
+
+    #[test]
+    fn measurement_fanout_is_grouped_and_renders_to_png() {
+        let src = r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "apply"
+            kind = "engine"
+            op = "apply"
+            [[task]]
+            name = "correctness"
+            kind = "evaluate"
+            command = "./correctness.sh"
+            depends_on = ["apply"]
+            [[task]]
+            name = "latency"
+            kind = "evaluate"
+            command = "./latency.sh"
+            threshold = 12.5
+            direction = "lower"
+            depends_on = ["correctness"]
+            isolation = "worktree"
+            [[task]]
+            name = "racecheck"
+            kind = "evaluate"
+            command = "./racecheck.sh"
+            depends_on = ["correctness"]
+            isolation = "worktree"
+            required = false
+            [[task]]
+            name = "grade"
+            kind = "engine"
+            op = "grade"
+            source = "latency"
+            depends_on = ["latency", "racecheck"]
+            join = "passed"
+        "#;
+        let plan = Plan::from_toml_str(src).unwrap().validate().unwrap();
+        let mermaid = render_mermaid(&plan, &BTreeSet::new());
+        assert!(mermaid.contains("subgraph measurement[\"Measurement\"]"));
+        assert!(mermaid.contains(":::evaluate"), "{mermaid}");
+        assert!(mermaid.contains(":::grade"), "{mermaid}");
+        assert!(
+            mermaid.contains("classDef evaluate fill:#076678"),
+            "{mermaid}"
+        );
+        assert!(
+            !mermaid.contains("run:"),
+            "public source omits commands: {mermaid}"
+        );
+        assert!(mermaid.contains("t1 --> t2"), "rung edge: {mermaid}");
+        assert!(mermaid.contains("t1 --> t3"), "parallel fanout: {mermaid}");
+
+        let raster =
+            render_mermaid_styled(&plan, &BTreeSet::new(), Styling::PerNode, Metadata::Preview);
+        assert!(!raster.contains(":::"), "{raster}");
+        assert!(raster.contains("style t1 fill:#076678"), "{raster}");
+        assert!(raster.contains("style t4 fill:#d65d0e"), "{raster}");
+        assert!(raster.contains("correctness<br/>run: ./correctness.sh"));
+        assert!(raster.contains("latency<br/>run: ./latency.sh<br/>pass: score &lt;= 12.5"));
+
+        let output = std::env::temp_dir().join(format!(
+            "crucible-measurement-render-{}.png",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&output);
+        let (width, height) = render_png_to(&plan, &BTreeSet::new(), &output).unwrap();
+        let png = std::fs::read(&output).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(width > 0 && height > 0);
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn mermaid_command_metadata_is_compact_escaped_and_truncated() {
+        let command = format!("printf   '<unsafe> & ready'\n{}", "x".repeat(100));
+        let preview = mermaid_command_preview(&command);
+
+        assert!(!preview.contains('\n'));
+        assert!(preview.contains("&lt;unsafe&gt; &amp; ready"));
+        assert!(preview.ends_with('…'));
+        assert_eq!(preview.matches("  ").count(), 0);
     }
 
     #[test]

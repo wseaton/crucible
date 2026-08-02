@@ -88,11 +88,15 @@ pub enum AgentSource {
 
 /// Whether this turn configuration supports durable sessions.
 pub(crate) fn supports_persistent_sessions(args: &Args) -> bool {
-    match args.agent_source() {
-        AgentSource::Command(_) => true,
-        AgentSource::LocalClaude => args.harness() == crate::harness::Harness::Claude,
-        AgentSource::OpenshellDriver => args.harness() == crate::harness::Harness::Claude,
-    }
+    backend_supports_persistent_sessions(args.agent_backend, args.harness())
+}
+
+/// Capability predicate used by runtime admission and scope preview.
+pub(crate) fn backend_supports_persistent_sessions(
+    backend: AgentBackend,
+    harness: crate::harness::Harness,
+) -> bool {
+    backend == AgentBackend::Command || harness == crate::harness::Harness::Claude
 }
 
 /// A spawned transport: a child process plus the streams a turn reads from it.

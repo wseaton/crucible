@@ -9,6 +9,8 @@ cluster and no LLM. If `crucible` can run this, the engine↔domain boundary
 - **Proposer (`bump.nu`):** the deterministic `command` agent backend, `value.txt += 1` per
   turn (stands in for an LLM, so the run is free, fast, and reproducible, a real e2e, not a mock).
 - **World:** GitWorld (no `[world]` block), kept iterations commit, discards `reset --hard`.
+- **Measurement graph:** isolated `shape` and `score` checks run in parallel; `grade` selects
+  `score` for the decision.
 
 ## Run (once the engine exists)
 
@@ -50,7 +52,6 @@ The second turn must report `action: "resumed"` and complete successfully. After
 
 ## What it proves
 
-Manifest parse → path resolution → `setup_cmd` → propose (`command` backend) → `measure`
-contract → universal `decide` (higher-wins) → GitWorld snapshot/restore + commit memory →
-Starlark workflow admission → durable session lifecycle → session log + reporters. A real domain
-is just this with a heavier judge and a live-rig World.
+Manifest parse → setup → propose → parallel evaluation → grade → decide → GitWorld commit memory
+→ Starlark admission → durable sessions and reporting. The opaque judge measures the baseline;
+the authored graph measures candidates. Real domains replace the evaluators and World.

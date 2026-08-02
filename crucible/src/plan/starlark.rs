@@ -111,6 +111,7 @@ enum Value {
     None,
     Bool(bool),
     Int(i32),
+    Float(f64),
     String(String),
     List(Vec<Value>),
     Task(Task),
@@ -169,6 +170,7 @@ impl Compiler {
                 TokenInt::I32(value) => Ok(Value::Int(*value)),
                 TokenInt::BigInt(_) => bail!("workflow integers must fit in 32 bits"),
             },
+            Expr::Literal(AstLiteral::Float(value)) => Ok(Value::Float(value.node)),
             Expr::List(items) | Expr::Tuple(items) => items
                 .iter()
                 .map(|item| self.expression(item))
@@ -311,6 +313,24 @@ impl Compiler {
                 isolation: isolation(take_bool_default(&mut named, "isolated", false)?),
                 join: parse_join(&take_string_default(&mut named, "join", "all")?)?,
             },
+            "evaluate" => {
+                let threshold = take_optional_number(&mut named, "threshold")?;
+                let direction = take_optional_direction(&mut named, "direction")?;
+                Task {
+                    name: TaskName(take_string(&mut named, "name")?),
+                    task: TaskKind::Evaluate {
+                        command: take_string(&mut named, "run")?,
+                        threshold,
+                        direction,
+                    },
+                    depends_on: take_task_names(&mut named)?,
+                    session: None,
+                    needs: take_string_default(&mut named, "needs", "any")?,
+                    required: take_bool_default(&mut named, "required", true)?,
+                    isolation: isolation(take_bool_default(&mut named, "isolated", false)?),
+                    join: parse_join(&take_string_default(&mut named, "join", "all")?)?,
+                }
+            }
             "top_k" => {
                 let k = take_int(&mut named, "k")?;
                 if k <= 0 {
@@ -341,6 +361,21 @@ impl Compiler {
             "propose" => engine_task(&mut named, EngineOp::Propose, None)?,
             "apply" => engine_task(&mut named, EngineOp::Apply, None)?,
             "measure" => engine_task(&mut named, EngineOp::Measure, None)?,
+            "grade" => {
+                let source = take_task_name(&mut named, "score")?;
+                let mut evidence = take_named_task_names(&mut named, "evidence")?;
+                if !evidence.contains(&source) {
+                    evidence.push(source.clone());
+                }
+                let mut task = engine(
+                    &take_string(&mut named, "name")?,
+                    EngineOp::Grade,
+                    Some(source),
+                    evidence,
+                );
+                task.join = parse_join(&take_string_default(&mut named, "join", "passed")?)?;
+                task
+            }
             "decide" => {
                 let source = take_task_name(&mut named, "measurement")?;
                 if !named.contains_key("depends_on") {
@@ -533,18 +568,56 @@ fn take_int(named: &mut BTreeMap<String, Value>, name: &str) -> Result<i32> {
     }
 }
 
+fn take_optional_number(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Option<f64>> {
+    match named.remove(name).unwrap_or(Value::None) {
+        Value::None => Ok(None),
+        Value::Int(value) => Ok(Some(value as f64)),
+        Value::Float(value) => Ok(Some(value)),
+        _ => bail!("argument {name:?} must be a number or None"),
+    }
+}
+
+fn take_optional_direction(
+    named: &mut BTreeMap<String, Value>,
+    name: &str,
+) -> Result<Option<Direction>> {
+    match named.remove(name).unwrap_or(Value::None) {
+        Value::None => Ok(None),
+        Value::String(value) if value == "lower" => Ok(Some(Direction::Lower)),
+        Value::String(value) if value == "higher" => Ok(Some(Direction::Higher)),
+        Value::String(value) => {
+            bail!("argument {name:?} must be `lower`, `higher`, or None, got {value:?}")
+        }
+        _ => bail!("argument {name:?} must be a string or None"),
+    }
+}
+
 fn take_task_names(named: &mut BTreeMap<String, Value>) -> Result<Vec<TaskName>> {
-    match named.remove("depends_on") {
+    take_named_task_names_optional(named, "depends_on")
+}
+
+fn take_named_task_names(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Vec<TaskName>> {
+    if !named.contains_key(name) {
+        bail!("missing required argument {name:?}");
+    }
+    take_named_task_names_optional(named, name)
+}
+
+fn take_named_task_names_optional(
+    named: &mut BTreeMap<String, Value>,
+    argument: &str,
+) -> Result<Vec<TaskName>> {
+    match named.remove(argument) {
         None => Ok(Vec::new()),
         Some(Value::List(names)) => names
             .into_iter()
             .map(|name| match name {
                 Value::String(name) => Ok(TaskName(name)),
                 Value::Task(task) => Ok(task.name),
-                _ => bail!("depends_on entries must be tasks or task-name strings"),
+                _ => bail!("{argument} entries must be tasks or task-name strings"),
             })
             .collect(),
-        Some(_) => bail!("depends_on must be a list of tasks or task-name strings"),
+        Some(_) => bail!("{argument} must be a list of tasks or task-name strings"),
     }
 }
 
@@ -787,6 +860,84 @@ default_autoresearch([review])
             .collect();
         assert_eq!(names, ["propose", "review", "apply", "measure", "decide"]);
         assert_eq!(compiled.workflow.result, Some("decide".into()));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn compiles_parallel_measurement_rungs_and_grade() {
+        let pack = temp_pack("measurement");
+        let source = r#"
+candidate = propose(name = "invent")
+live = apply(name = "deploy", depends_on = [candidate])
+correctness = evaluate(
+    name = "correctness",
+    run = "./correctness.sh",
+    depends_on = [live],
+    threshold = 1,
+    direction = "higher",
+    isolated = True,
+)
+latency = evaluate(
+    name = "latency",
+    run = "./latency.sh",
+    depends_on = [correctness],
+    threshold = 12.5,
+    direction = "lower",
+    isolated = True,
+)
+racecheck = evaluate(
+    name = "racecheck",
+    run = "./racecheck.sh",
+    depends_on = [correctness],
+    required = False,
+    isolated = True,
+)
+measurement = grade(
+    name = "final-grade",
+    evidence = [correctness, latency, racecheck],
+    score = latency,
+)
+choice = decide(name = "choose", measurement = measurement)
+workflow(
+    type = "autoresearch",
+    tasks = [candidate, live, correctness, latency, racecheck, measurement, choice],
+    result = choice,
+)
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(
+            compiled.workflow.tasks[3].depends_on,
+            vec!["correctness".into()]
+        );
+        assert_eq!(
+            compiled.workflow.tasks[4].depends_on,
+            vec!["correctness".into()]
+        );
+        let grade = &compiled.workflow.tasks[5];
+        assert_eq!(grade.join, Join::Passed);
+        assert_eq!(grade.depends_on.len(), 3);
+        assert!(matches!(
+            grade.task,
+            TaskKind::Engine {
+                op: EngineOp::Grade,
+                source: Some(ref source),
+            } if source == &TaskName("latency".to_string())
+        ));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn grade_join_is_authorable_with_passed_as_the_default() {
+        let pack = temp_pack("grade-join");
+        let source = r#"
+score = evaluate(name = "score", run = "./score.sh")
+strict = grade(name = "strict", evidence = [score], score = score, join = "all")
+lossy = grade(name = "lossy", evidence = [score], score = score)
+workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(compiled.workflow.tasks[1].join, Join::All);
+        assert_eq!(compiled.workflow.tasks[2].join, Join::Passed);
         let _ = std::fs::remove_dir_all(&pack);
     }
 

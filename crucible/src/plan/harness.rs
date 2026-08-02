@@ -185,12 +185,16 @@ fn run_in(
             model,
             effort,
         } => (prompt, harness, model, effort),
-        TaskKind::Command { .. } => {
+        TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
             let mut shell = ShellRunner {
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,
             };
-            return shell.run(task, attempt, inputs);
+            return if task.isolation == Some(Isolation::Worktree) {
+                shell.run_in_prepared_worktree(task, inputs)
+            } else {
+                shell.run(task, attempt, inputs)
+            };
         }
         TaskKind::TopK { .. } => {
             return fail(0.0, "reducer task reached the runner".to_string());
