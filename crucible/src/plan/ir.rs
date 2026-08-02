@@ -29,11 +29,12 @@ pub enum Direction {
     Higher,
 }
 
-/// The canonical loop's engine-owned stages: the driver's `World`/`Judge` calls as tasks.
-/// Propose is not here: it's a plain `Agent` task; the executor never touches git or the
-/// judge itself, the loop runner does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Authorable operations that require orchestrator capabilities to execute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EngineOp {
+    /// Run the loop's candidate-producing turn.
+    Propose,
     /// `World::apply`: make the candidate live (a failure = unscoreable, discard).
     Apply,
     /// `Judge::measure`: score the live candidate.
@@ -89,15 +90,17 @@ pub enum TaskKind {
         #[serde(default)]
         effort: Option<String>,
     },
-    /// A frozen deterministic command (the `measure_cmd` shape, generalized).
+    /// A plan-authored command. Trusted scripts require frozen manifest injects.
     Command { command: String },
     /// Engine-builtin deterministic fold: keep the k best upstream outputs by `score`.
     TopK { k: u32, direction: Direction },
-    /// An engine-owned loop stage. Engine-constructable only: the variant is serde-skipped,
-    /// so no TOML/JSON front-end can author one: packs and agent plans never sequence the
-    /// `World`/`Judge` directly.
-    #[serde(skip)]
-    Engine(EngineOp),
+    /// A capability-owned engine operation.
+    Engine {
+        op: EngineOp,
+        /// Typed input; dependencies still control scheduling.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<TaskName>,
+    },
 }
 
 impl TaskKind {
@@ -107,10 +110,13 @@ impl TaskKind {
             TaskKind::Agent { .. } => "agent",
             TaskKind::Command { .. } => "command",
             TaskKind::TopK { .. } => "top_k",
-            TaskKind::Engine(EngineOp::Apply) => "engine_apply",
-            TaskKind::Engine(EngineOp::Measure) => "engine_measure",
-            TaskKind::Engine(EngineOp::Decide) => "engine_decide",
-            TaskKind::Engine(EngineOp::MeasureDiff) => "engine_measure_diff",
+            TaskKind::Engine { op, .. } => match op {
+                EngineOp::Propose => "engine_propose",
+                EngineOp::Apply => "engine_apply",
+                EngineOp::Measure => "engine_measure",
+                EngineOp::Decide => "engine_decide",
+                EngineOp::MeasureDiff => "engine_measure_diff",
+            },
         }
     }
 }
@@ -144,14 +150,13 @@ pub struct Task {
     pub join: Join,
 }
 
-/// Executor-enforced ceiling. Spending past it fails closed: it is not advice.
+/// Executor-enforced accounting limit; overruns fail the plan.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PlanBudget {
     pub usd: f64,
 }
 
-/// A versioned work graph. Frozen once validated; a replan is a new `Plan` with
-/// `version + 1` and a recorded `reason`, never a mutation.
+/// A versioned work graph. `reason` is reserved for replanning.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Plan {
     pub version: u32,
@@ -180,15 +185,14 @@ impl ValidPlan {
         self.topo.iter().map(|&i| &self.plan.tasks[i])
     }
 
-    #[allow(dead_code)] // test-only until the judge wiring consumes plans by task name
+    #[allow(dead_code)]
     pub fn get(&self, name: &TaskName) -> Option<&Task> {
         self.plan.tasks.iter().find(|t| &t.name == name)
     }
 }
 
 impl Plan {
-    /// Parse the agent-emitted `PLAN.json` sentinel body. Parsing is not admission:
-    /// call `validate` then `AdmissionCaps::admit` before anything runs.
+    /// Parse JSON without validating it.
     pub fn from_json_str(s: &str) -> Result<Plan> {
         serde_json::from_str(s).context("PLAN.json does not parse as a plan")
     }
@@ -198,15 +202,11 @@ impl Plan {
         toml::from_str(s).context("plan TOML does not parse")
     }
 
-    /// Structural validation: unique names, edges resolve, acyclic, budget declared,
-    /// replans carry a reason. Returns the frozen, topologically ordered plan.
+    /// Validate structure and compute dependency order.
     pub fn validate(self) -> Result<ValidPlan> {
-        if self.version == 0 {
-            bail!("plan version must be >= 1");
-        }
-        if self.version > 1 && self.reason.as_deref().unwrap_or("").trim().is_empty() {
+        if self.version != 1 {
             bail!(
-                "plan version {} is a replan and must record a reason",
+                "unsupported plan version {}; this build supports only version 1",
                 self.version
             );
         }
@@ -291,38 +291,6 @@ impl Plan {
             );
         }
         Ok(ValidPlan { plan: self, topo })
-    }
-}
-
-/// The authorship/admission split: an agent may *write* any plan; what *runs* is capped by
-/// grants the manifest or a human already made. A plan cannot raise its own ceiling.
-// Test-only until the PLAN.json sentinel drain lands and admits through this.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-pub struct AdmissionCaps {
-    pub max_usd: f64,
-    pub max_tasks: usize,
-}
-
-impl AdmissionCaps {
-    #[allow(dead_code)] // see the struct note
-    pub fn admit(&self, plan: &ValidPlan) -> Result<()> {
-        let p = plan.plan();
-        if p.budget.usd > self.max_usd {
-            bail!(
-                "plan budget ${} exceeds the admitted cap ${} — plans cannot self-authorize spend",
-                p.budget.usd,
-                self.max_usd
-            );
-        }
-        if p.tasks.len() > self.max_tasks {
-            bail!(
-                "plan declares {} tasks, cap is {} — plans cannot self-authorize scope",
-                p.tasks.len(),
-                self.max_tasks
-            );
-        }
-        Ok(())
     }
 }
 
@@ -413,11 +381,13 @@ mod tests {
     }
 
     #[test]
-    fn replan_without_reason_rejected() {
-        let mut p = plan(vec![agent("a", &[])]);
-        p.version = 2;
-        let err = p.validate().unwrap_err();
-        assert!(err.to_string().contains("must record a reason"));
+    fn unsupported_plan_versions_are_rejected() {
+        for version in [0, 2, u32::MAX] {
+            let mut p = plan(vec![agent("a", &[])]);
+            p.version = version;
+            let err = p.validate().unwrap_err();
+            assert!(err.to_string().contains("supports only version 1"));
+        }
     }
 
     #[test]
@@ -448,48 +418,24 @@ mod tests {
     }
 
     #[test]
-    fn admission_caps_budget() {
-        let v = plan(vec![agent("a", &[])]).validate().unwrap();
-        let err = AdmissionCaps {
-            max_usd: 1.0,
-            max_tasks: 10,
-        }
-        .admit(&v)
-        .unwrap_err();
-        assert!(err.to_string().contains("cannot self-authorize spend"));
-        assert!(
-            AdmissionCaps {
-                max_usd: 5.0,
-                max_tasks: 10
+    fn engine_tasks_are_authorable_data_but_legacy_kind_aliases_are_rejected() {
+        let authored = "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"score\"\nkind = \"engine\"\nop = \"measure\"\n";
+        let plan = Plan::from_toml_str(authored).unwrap();
+        assert!(matches!(
+            plan.tasks[0].task,
+            TaskKind::Engine {
+                op: EngineOp::Measure,
+                source: None
             }
-            .admit(&v)
-            .is_ok()
-        );
-    }
+        ));
 
-    #[test]
-    fn admission_caps_task_count() {
-        let v = plan(vec![agent("a", &[]), agent("b", &[])])
-            .validate()
-            .unwrap();
-        let err = AdmissionCaps {
-            max_usd: 100.0,
-            max_tasks: 1,
-        }
-        .admit(&v)
-        .unwrap_err();
-        assert!(err.to_string().contains("cannot self-authorize scope"));
-    }
-
-    #[test]
-    fn engine_tasks_are_not_authorable() {
-        for kind in ["engine", "engine_apply", "engine_measure", "engine_decide"] {
+        for kind in ["engine_apply", "engine_measure", "engine_decide"] {
             let src = format!(
                 "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"x\"\nkind = \"{kind}\"\n"
             );
             assert!(
                 Plan::from_toml_str(&src).is_err(),
-                "kind {kind:?} must not parse — engine tasks are engine-constructable only"
+                "legacy kind alias {kind:?} must not parse"
             );
         }
     }

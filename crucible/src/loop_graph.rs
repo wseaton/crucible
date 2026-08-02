@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use crate::crucible::{Judge, MeasureCtx, World};
 use crate::loop_driver::{self, Decided, IterStep, Measured, TurnVerdict};
+use crate::manifest::{WorkflowCaps, WorkflowCfg, WorkflowType};
 use crate::plan::exec::{
     Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, execute,
 };
@@ -42,13 +43,17 @@ pub(crate) struct IterCtx<'a> {
     /// the typestate path would after the turn.
     pub spent_before: f64,
     pub started: Instant,
+    pub workflow: Option<&'a WorkflowCfg>,
 }
 
-/// Run one iteration as the canonical template. Returns the driver-vocabulary step plus
-/// the iteration's cost to fold into the run's spend. A measure error propagates as
-/// `Err`, exactly like the typestate path's `?`.
+/// Run one admitted autoresearch iteration and return its step and cost.
 pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(IterStep, f64)> {
-    let plan = iteration_template(cx.prompt)?;
+    let plan = iteration_template(cx.workflow)?;
+    let result_task = cx
+        .workflow
+        .filter(|workflow| !workflow.is_legacy_splice())
+        .and_then(|workflow| workflow.result.clone())
+        .unwrap_or_else(|| "decide".into());
     r.plan_event(&crate::plan::cli::plan_admitted_event(&plan));
 
     let mut runner = LoopTaskRunner {
@@ -59,6 +64,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         control: cx.control,
         r,
         it: cx.it,
+        prompt: cx.prompt,
         rows: cx.rows,
         ctx: MeasureCtx {
             baseline_score: Some(cx.baseline_score),
@@ -69,9 +75,13 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         spent_before: cx.spent_before,
         started: cx.started,
         signal: None,
-        measured: None,
-        decided: None,
+        measured: BTreeMap::new(),
+        decided: BTreeMap::new(),
         fatal: None,
+        workflow_runner: crate::plan::harness::HarnessRunner {
+            args: cx.args.clone(),
+            paths: cx.p.clone(),
+        },
     };
     // The runner and the on_result hook both need the reporter; collect the wire lines
     // here and append them after the executor returns (they're additive either way).
@@ -102,56 +112,106 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         Some(Signal::Escalate) => IterStep::Escalated,
         Some(Signal::Park(pp)) => IterStep::Parked(pp),
         Some(Signal::Stop) => IterStep::Stopped,
-        None => match runner.decided.take() {
+        None => match runner.decided.remove(&result_task) {
             Some(d) => IterStep::Decided(Box::new(d)),
-            None => anyhow::bail!(
-                "graph iteration ended with neither a decision nor a control signal (exit: {:?})",
-                outcome.exit
-            ),
+            // A pre-gate rejection discards the candidate.
+            None => match &outcome.exit {
+                crate::plan::exec::PlanExit::ShortCircuit { task } => {
+                    let why = outcome
+                        .results
+                        .get(task)
+                        .and_then(|r| r.note.clone())
+                        .unwrap_or_default();
+                    runner.r.note(&format!(
+                        "workflow task {task} rejected the candidate (discarding iter {}): {why}",
+                        cx.it
+                    ));
+                    IterStep::Discarded
+                }
+                exit => anyhow::bail!(
+                    "graph iteration ended with neither a decision nor a control signal (exit: {exit:?})"
+                ),
+            },
         },
     };
     Ok((step, outcome.spent_usd))
 }
 
-/// The canonical iteration template: `propose → apply → measure → decide`, all required,
-/// so a failed stage short-circuits the rest: the same "nothing runs on top of a
-/// failure" the typestate chain encoded in types.
-fn iteration_template(prompt: &str) -> Result<ValidPlan> {
-    let engine = |name: &str, op: EngineOp, dep: &str| Task {
-        name: name.into(),
-        task: TaskKind::Engine(op),
-        depends_on: vec![dep.into()],
-        needs: "any".to_string(),
-        required: true,
-        isolation: None,
-        join: Join::default(),
-    };
-    Plan {
-        version: 1,
-        reason: None,
-        budget: PlanBudget { usd: f64::MAX },
-        tasks: vec![
+/// Build and admit the default or authored iteration graph.
+fn iteration_template(workflow: Option<&WorkflowCfg>) -> Result<ValidPlan> {
+    if let Some(workflow) = workflow.filter(|workflow| !workflow.is_legacy_splice()) {
+        workflow
+            .admit(&WorkflowCaps::autoresearch_engine())
+            .context("admitting authored workflow into the autoresearch loop")?;
+        return Plan {
+            version: 1,
+            reason: None,
+            budget: PlanBudget { usd: f64::MAX },
+            tasks: workflow.tasks.clone(),
+        }
+        .validate()
+        .context("building authored iteration workflow");
+    }
+
+    let engine =
+        |name: &str, op: EngineOp, source: Option<TaskName>, deps: Vec<TaskName>| -> Task {
             Task {
-                name: "propose".into(),
-                task: TaskKind::Agent {
-                    prompt: prompt.to_string(),
-                    harness: None,
-                    model: None,
-                    effort: None,
-                },
-                depends_on: vec![],
+                name: name.into(),
+                task: TaskKind::Engine { op, source },
+                depends_on: deps,
                 needs: "any".to_string(),
                 required: true,
                 isolation: None,
                 join: Join::default(),
-            },
-            engine("apply", EngineOp::Apply, "propose"),
-            engine("measure", EngineOp::Measure, "apply"),
-            engine("decide", EngineOp::Decide, "measure"),
-        ],
+            }
+        };
+    let mut tasks = vec![engine("propose", EngineOp::Propose, None, vec![])];
+
+    // Legacy splice tasks run between `propose` and `apply`; `apply` waits on every sink.
+    let mut apply_deps = vec![TaskName("propose".to_string())];
+    if let Some(w) = workflow.filter(|w| !w.tasks.is_empty()) {
+        for t in &w.tasks {
+            let mut t = t.clone();
+            if t.depends_on.is_empty() {
+                t.depends_on = vec![TaskName("propose".to_string())];
+            }
+            tasks.push(t);
+        }
+        let sinks = w.sinks();
+        if !sinks.is_empty() {
+            apply_deps = sinks;
+        }
+    }
+
+    tasks.push(engine("apply", EngineOp::Apply, None, apply_deps));
+    tasks.push(engine(
+        "measure",
+        EngineOp::Measure,
+        None,
+        vec![TaskName("apply".to_string())],
+    ));
+    tasks.push(engine(
+        "decide",
+        EngineOp::Decide,
+        Some(TaskName("measure".to_string())),
+        vec![TaskName("measure".to_string())],
+    ));
+    let workflow = WorkflowCfg {
+        workflow_type: WorkflowType::Autoresearch,
+        result: Some("decide".into()),
+        tasks,
+    };
+    workflow
+        .admit(&WorkflowCaps::autoresearch_engine())
+        .context("admitting the default autoresearch workflow")?;
+    Plan {
+        version: 1,
+        reason: None,
+        budget: PlanBudget { usd: f64::MAX },
+        tasks: workflow.tasks,
     }
     .validate()
-    .context("building the canonical iteration template")
+    .context("building the iteration template")
 }
 
 /// What the propose task's post-turn drains decided, parked here for the driver: the
@@ -174,15 +234,17 @@ struct LoopTaskRunner<'a, R: Reporter> {
     control: Option<&'a control::ControlState>,
     r: &'a mut R,
     it: u32,
+    prompt: &'a str,
     rows: &'a [Row],
     ctx: MeasureCtx,
     best_score: f64,
     spent_before: f64,
     started: Instant,
     signal: Option<Signal>,
-    measured: Option<Measured>,
-    decided: Option<Decided>,
+    measured: BTreeMap<TaskName, Measured>,
+    decided: BTreeMap<TaskName, Decided>,
     fatal: Option<anyhow::Error>,
+    workflow_runner: crate::plan::harness::HarnessRunner,
 }
 
 impl<R: Reporter> LoopTaskRunner<'_, R> {
@@ -240,27 +302,33 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
         }
     }
 
-    fn measure(&mut self) -> Attempt {
+    fn measure(&mut self, task: &Task) -> Attempt {
         match loop_driver::measure_candidate(self.judge, &self.ctx, self.p, self.world) {
             Ok(m) => {
                 let out = serde_json::json!({ "score": m.reading.score, "valid": m.reading.valid });
-                self.measured = Some(m);
+                self.measured.insert(task.name.clone(), m);
                 pass(out)
             }
             Err(e) => {
-                // A measure error aborts the run on the typestate path (`?`); park it for
-                // the driver to propagate once the executor unwinds.
+                // Propagate after the executor unwinds.
                 self.fatal = Some(e);
                 fail(0.0, "measure errored; aborting the run".to_string())
             }
         }
     }
 
-    fn decide(&mut self) -> Attempt {
-        let Some(m) = self.measured.take() else {
+    fn decide(&mut self, task: &Task, source: Option<&TaskName>) -> Attempt {
+        let Some(source) = source else {
             return fail(
                 0.0,
-                "decide dispatched without a measured candidate".to_string(),
+                "decide dispatched without a measurement source".to_string(),
+            );
+        };
+        // Admission prevents two decisions from consuming one measurement.
+        let Some(m) = self.measured.remove(source) else {
+            return fail(
+                0.0,
+                format!("decide source {source} has no measured candidate"),
             );
         };
         let d = loop_driver::decide_row(self.judge, self.best_score, self.it, m);
@@ -269,20 +337,37 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
             "solved": d.verdict.solved,
             "score": d.reading.score,
         });
-        self.decided = Some(d);
+        self.decided.insert(task.name.clone(), d);
         pass(out)
     }
 }
 
 impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
-    fn run(&mut self, task: &Task, _attempt: u32, _inputs: &BTreeMap<TaskName, Value>) -> Attempt {
+    fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         match &task.task {
-            TaskKind::Agent { prompt, .. } => self.propose(prompt),
-            TaskKind::Engine(EngineOp::Apply) => self.apply(),
-            TaskKind::Engine(EngineOp::Measure) => self.measure(),
-            TaskKind::Engine(EngineOp::Decide) => self.decide(),
-            TaskKind::Engine(EngineOp::MeasureDiff)
-            | TaskKind::Command { .. }
+            TaskKind::Agent { .. } | TaskKind::Command { .. } => {
+                self.workflow_runner.run(task, attempt, inputs)
+            }
+            TaskKind::Engine {
+                op: EngineOp::Propose,
+                ..
+            } => self.propose(self.prompt),
+            TaskKind::Engine {
+                op: EngineOp::Apply,
+                ..
+            } => self.apply(),
+            TaskKind::Engine {
+                op: EngineOp::Measure,
+                ..
+            } => self.measure(task),
+            TaskKind::Engine {
+                op: EngineOp::Decide,
+                source,
+            } => self.decide(task, source.as_ref()),
+            TaskKind::Engine {
+                op: EngineOp::MeasureDiff,
+                ..
+            }
             | TaskKind::TopK { .. } => fail(
                 0.0,
                 format!(
@@ -291,6 +376,10 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
                 ),
             ),
         }
+    }
+
+    fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
+        self.workflow_runner.run_many(batch)
     }
 }
 
@@ -503,7 +592,10 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
     for id in 0..cfg.n {
         tasks.push(Task {
             name: TaskName(format!("measure-{id}")),
-            task: TaskKind::Engine(EngineOp::MeasureDiff),
+            task: TaskKind::Engine {
+                op: EngineOp::MeasureDiff,
+                source: None,
+            },
             depends_on: vec![TaskName(format!("propose-{id}"))],
             needs: "any".to_string(),
             required: false,
@@ -708,7 +800,10 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
                     &pending,
                 )
             }
-            TaskKind::Engine(EngineOp::MeasureDiff) => self.measure_diff(task, inputs),
+            TaskKind::Engine {
+                op: EngineOp::MeasureDiff,
+                ..
+            } => self.measure_diff(task, inputs),
             other => fail(
                 0.0,
                 format!(
@@ -827,15 +922,118 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn pack_tasks_splice_between_the_turn_and_the_gate() {
+        let w: WorkflowCfg = toml::from_str(
+            "[[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\n             [[task]]\nname = \"lint\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"review\"]\n",
+        )
+        .unwrap();
+        w.validate().unwrap();
+        let plan = iteration_template(Some(&w)).unwrap();
+        let names: Vec<&str> = plan.tasks_topo().map(|t| t.name.0.as_str()).collect();
+        assert_eq!(
+            names,
+            ["propose", "review", "lint", "apply", "measure", "decide"]
+        );
+        let dep = |n: &str| {
+            plan.get(&n.into())
+                .unwrap()
+                .depends_on
+                .iter()
+                .map(|d| d.0.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            dep("review"),
+            ["propose"],
+            "an unattached task hangs off propose"
+        );
+        assert_eq!(
+            dep("apply"),
+            ["lint"],
+            "apply waits on the sink, not on propose"
+        );
+        assert_eq!(dep("measure"), ["apply"]);
+        assert_eq!(dep("decide"), ["measure"]);
+    }
+
+    #[test]
+    fn a_rejecting_pack_task_discards_the_iteration_before_measuring() {
+        let trace = run_counter_cfg(
+            true,
+            2,
+            BUMP,
+            false,
+            Some(
+                "\n[[workflow.task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"exit 1\"\n",
+            ),
+        );
+        let decisions: Vec<&str> = trace.rows.iter().map(|(_, d, _)| d.as_str()).collect();
+        assert_eq!(
+            decisions,
+            ["baseline"],
+            "every iteration is discarded before it can be measured: {}",
+            describe(&trace)
+        );
+        assert!(
+            trace.notes.iter().any(|n| n.contains("review")
+                && n.contains("rejected the candidate")
+                && n.contains("exit 1")),
+            "the discard names the task that rejected it: {:?}",
+            trace.notes
+        );
+        assert!(
+            trace
+                .notes
+                .iter()
+                .all(|n| !n.contains("unexpected task kind")),
+            "the command must execute rather than fail runner dispatch: {:?}",
+            trace.notes
+        );
+        assert_eq!(trace.shutdown, "finished", "a rejection is not a run error");
+    }
+
+    #[test]
     fn template_is_the_canonical_chain() {
-        let plan = iteration_template("go").unwrap();
+        let plan = iteration_template(None).unwrap();
         let names: Vec<&str> = plan.tasks_topo().map(|t| t.name.0.as_str()).collect();
         assert_eq!(names, ["propose", "apply", "measure", "decide"]);
         assert!(plan.tasks_topo().all(|t| t.required));
         let kinds: Vec<&str> = plan.tasks_topo().map(|t| t.task.label()).collect();
         assert_eq!(
             kinds,
-            ["agent", "engine_apply", "engine_measure", "engine_decide"]
+            [
+                "engine_propose",
+                "engine_apply",
+                "engine_measure",
+                "engine_decide"
+            ]
+        );
+    }
+
+    #[test]
+    fn authored_autoresearch_uses_semantics_instead_of_reserved_names() {
+        let workflow: WorkflowCfg = toml::from_str(
+            "type = \"autoresearch\"\nresult = \"keep-if-better\"\n\
+             [[task]]\nname = \"invent\"\nkind = \"engine\"\nop = \"propose\"\n\
+             [[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"invent\"]\n\
+             [[task]]\nname = \"deploy-preview\"\nkind = \"engine\"\nop = \"apply\"\ndepends_on = [\"review\"]\n\
+             [[task]]\nname = \"benchmark-a\"\nkind = \"engine\"\nop = \"measure\"\ndepends_on = [\"deploy-preview\"]\n\
+             [[task]]\nname = \"explain-score\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"benchmark-a\"]\n\
+             [[task]]\nname = \"keep-if-better\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"benchmark-a\"\ndepends_on = [\"benchmark-a\", \"explain-score\"]\n",
+        )
+        .unwrap();
+        let plan = iteration_template(Some(&workflow)).unwrap();
+        let names: Vec<&str> = plan.tasks_topo().map(|task| task.name.0.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "invent",
+                "review",
+                "deploy-preview",
+                "benchmark-a",
+                "explain-score",
+                "keep-if-better"
+            ]
         );
     }
 
@@ -874,10 +1072,16 @@ mod tests {
     /// path. sh stands in for nu so the fixture is self-contained. The measure declares
     /// solved at value >= 3, so a multi-iteration run exercises the early stop.
     fn run_counter(graph_loop: bool, iterations: u32, bump: &str) -> RunTrace {
-        run_counter_cfg(graph_loop, iterations, bump, false)
+        run_counter_cfg(graph_loop, iterations, bump, false, None)
     }
 
-    fn run_counter_cfg(graph_loop: bool, iterations: u32, bump: &str, wide: bool) -> RunTrace {
+    fn run_counter_cfg(
+        graph_loop: bool,
+        iterations: u32,
+        bump: &str,
+        wide: bool,
+        workflow: Option<&str>,
+    ) -> RunTrace {
         // A counter, not a timestamp: two tests starting in the same microsecond would get
         // the same name, and the first thing this does is remove_dir_all.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -906,6 +1110,7 @@ mod tests {
             }
         }
         let manifest_path = dir.join("crucible.toml");
+        let workflow_block = workflow.unwrap_or("");
         let search_block = if wide {
             "\n[search]\nwide = 3\napproaches = [\"plus one\", \"add a unit\", \"increment\"]\npolicy_k = 1\n"
         } else {
@@ -928,7 +1133,7 @@ mod tests {
             measure_cmd = "./measure.sh"
             direction = "higher"
             objective = "value"
-            {search_block}"#
+            {search_block}{workflow_block}"#
             ),
         )
         .unwrap();
@@ -951,6 +1156,7 @@ mod tests {
         args.iterations = iterations;
         args.graph_loop = graph_loop;
         args.search = m.search.clone();
+        args.workflow = m.workflow.clone();
 
         let prep = Prepared {
             goal: "raise the value".into(),
@@ -982,7 +1188,9 @@ mod tests {
             LoopRuntime::default(),
         )
         .unwrap();
-        assert!(outcome.improved, "the counter bump must be kept");
+        if workflow.is_none() {
+            assert!(outcome.improved, "the counter bump must be kept");
+        }
 
         let log = std::fs::read_to_string(&p.session_log).unwrap();
         let mut kinds = Vec::new();
@@ -1107,8 +1315,8 @@ mod tests {
     /// top of the seeded workspace under both paths.
     #[test]
     fn counter_parity_wide_tournament() {
-        let legacy = run_counter_cfg(false, 2, BUMP, true);
-        let graph = run_counter_cfg(true, 2, BUMP, true);
+        let legacy = run_counter_cfg(false, 2, BUMP, true, None);
+        let graph = run_counter_cfg(true, 2, BUMP, true, None);
 
         // Shape pinned on the legacy path first: 3 measured candidates at value 2 (each
         // row appears twice on the wire: once at measure time, once in the driver's

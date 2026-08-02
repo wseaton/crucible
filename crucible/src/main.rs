@@ -588,6 +588,15 @@ pub(crate) struct Args {
     /// Wide-round search config (from `[search]`). No CLI flag, set by `run_from_manifest`.
     #[arg(skip)]
     pub search: Option<manifest::SearchCfg>,
+    /// Manifest-only authored workflow.
+    #[arg(skip)]
+    pub workflow: Option<manifest::WorkflowCfg>,
+    /// Manifest injects restored in each task workspace.
+    #[arg(skip)]
+    pub workflow_frozen_injects: Vec<(PathBuf, PathBuf)>,
+    /// Toolbox exclusions for per-task harness overrides.
+    #[arg(skip)]
+    pub workflow_toolbox_exclude: Vec<String>,
     /// Opt-in: when publish-on-keep opens draft PR(s), spawn a detached `crucible watch-pr` pointed
     /// at them, reseeding this run's `STEER.md` from review comments so the NEXT run picks up feedback
     /// without a human running `watch-pr` by hand. Best-effort: spawn failure only logs (the PR still

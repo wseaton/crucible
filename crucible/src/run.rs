@@ -313,6 +313,7 @@ pub(crate) fn prep_plan_runner(
     vcs::ensure_repo(&workspace).context("ensuring workspace is a git repo")?;
     std::fs::create_dir_all(&p.state)
         .with_context(|| format!("creating state dir {}", p.state.display()))?;
+    install_toolbox(&p, &m.agent.toolbox_exclude, m.agent.harness.skills_dir())?;
     // Default Args (as if `crucible` ran flagless), then the manifest's [agent] folded on top —
     // the same resolution a loop run does.
     let mut args = <Cli as clap::Parser>::try_parse_from(["crucible"])
@@ -320,6 +321,8 @@ pub(crate) fn prep_plan_runner(
         .run;
     args.manifest = Some(manifest_path.to_path_buf());
     apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
+    args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir);
+    args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     Ok(crate::plan::harness::HarnessRunner { args, paths: p })
 }
 
@@ -410,6 +413,9 @@ fn run_from_manifest(args: Args) -> Result<()> {
         .map(|(src, dst, _)| (src, dst))
         .collect();
     args.search = m.search.clone();
+    args.workflow = m.workflow.clone();
+    args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir);
+    args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     let world = m.build_world(workspace.clone());
     let judge = m.build_judge(workspace, frozen_injects)?;
 
@@ -489,6 +495,9 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
     };
 
     args.search = m.search.clone();
+    args.workflow = m.workflow.clone();
+    args.workflow_frozen_injects = Vec::new();
+    args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     let world = m.build_world(&manifest_dir)?;
     let judge = m.build_judge(&manifest_dir)?;
     drive_loop(args, p, prep, world, judge)
@@ -775,7 +784,7 @@ fn start_control_bridge(
 /// never see, see [`manifest::AgentCfg::toolbox_exclude`]. A name in `exclude` that doesn't
 /// exist under the toolbox dir is a manifest bug (the exclusion is silently doing nothing), so
 /// it's an error rather than a warning.
-fn install_toolbox(p: &Paths, exclude: &[String], skills_dir: &str) -> Result<()> {
+pub(crate) fn install_toolbox(p: &Paths, exclude: &[String], skills_dir: &str) -> Result<()> {
     let Some(src) = &p.skills else {
         return Ok(());
     };

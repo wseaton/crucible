@@ -8,14 +8,12 @@
 //! its sentinel files. No file, no pass.
 
 use std::collections::BTreeMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 use clap::ValueEnum;
 
 use serde_json::Value;
 
-use crate::event::RawStream;
+use crate::event::{AgentEvent, RawStream};
 use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner};
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
@@ -92,27 +90,16 @@ fn run_task(
     pending: Option<&str>,
 ) -> Attempt {
     let Some(Isolation::Worktree) = task.isolation else {
-        return run_in(args, paths, task, attempt, inputs);
+        return prepare_and_run(args, paths, task, attempt, inputs);
     };
     // A private clone of the workspace. Its edits are discarded on cleanup: what leaves an
     // isolated task is its declared output, so this is for review/analysis work, not for
     // coding tasks whose diff has to survive (the wide tournament carries those out itself).
     let root = paths.state.join("plan-iso");
     if let Err(e) = std::fs::create_dir_all(&root) {
-        return fail(0.0, format!("creating the isolation root failed: {e}"));
+        return transport(format!("creating the isolation root failed: {e}"));
     }
-    let slug: String = task
-        .name
-        .0
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    // The slug alone is not injective ("a b" and "a-b" collide), and setup() starts by
-    // deleting the destination: colliding names in one concurrent batch would wipe each
-    // other's clone. The hash of the raw name makes the directory unique.
-    let mut hasher = DefaultHasher::new();
-    task.name.0.hash(&mut hasher);
-    let worktree = root.join(format!("{slug}-{:08x}", hasher.finish() as u32));
+    let worktree = root.join(task_worktree_name(&task.name));
     let captured;
     let pending = match pending {
         Some(p) => p,
@@ -130,13 +117,32 @@ fn run_task(
         },
     };
     if let Err(e) = crate::plan::worktree::setup(&paths.workspace, &worktree, pending) {
-        return fail(0.0, format!("worktree setup failed: {e:#}"));
+        return transport(format!("worktree setup failed: {e:#}"));
     }
     let iso = Paths::for_worktree(worktree.clone(), paths.skills.clone());
     let _ = std::fs::create_dir_all(&iso.state);
-    let attempt_out = run_in(args, &iso, task, attempt, inputs);
+    let attempt_out = prepare_and_run(args, &iso, task, attempt, inputs);
     let _ = std::fs::remove_dir_all(&worktree);
     attempt_out
+}
+
+fn prepare_and_run(
+    args: &Args,
+    paths: &Paths,
+    task: &Task,
+    attempt: u32,
+    inputs: &BTreeMap<TaskName, Value>,
+) -> Attempt {
+    for (src, dst) in &args.workflow_frozen_injects {
+        if let Err(e) = crate::manifest::apply_inject(src, &paths.workspace.join(dst)) {
+            return transport(format!(
+                "restoring frozen inject {} -> {} failed: {e:#}",
+                src.display(),
+                dst.display()
+            ));
+        }
+    }
+    run_in(args, paths, task, attempt, inputs)
 }
 
 /// One task against a specific workspace. `Command` tasks go to the shell runner; `Agent`
@@ -165,7 +171,7 @@ fn run_in(
         TaskKind::TopK { .. } => {
             return fail(0.0, "reducer task reached the runner".to_string());
         }
-        TaskKind::Engine(_) => {
+        TaskKind::Engine { .. } => {
             return fail(0.0, "engine task reached a non-loop runner".to_string());
         }
     };
@@ -189,6 +195,13 @@ fn run_in(
             Err(err) => return fail(0.0, format!("task names unknown effort {e:?}: {err}")),
         }
     }
+    if let Err(e) = crate::run::install_toolbox(
+        paths,
+        &args.workflow_toolbox_exclude,
+        args.harness().skills_dir(),
+    ) {
+        return transport(format!("installing the task toolbox failed: {e:#}"));
+    }
 
     let inputs_json = match serde_json::to_string_pretty(inputs) {
         Ok(j) => j,
@@ -205,9 +218,13 @@ fn run_in(
     let _ = std::fs::remove_file(&result_path);
 
     let name = task.name.0.clone();
-    let cost = crate::agent::run_turn(&args, paths, &full_prompt, false, |line, stream, _ev| {
+    let mut transport_error: Option<String> = None;
+    let cost = crate::agent::run_turn(&args, paths, &full_prompt, false, |line, stream, ev| {
         if !line.trim().is_empty() && stream == RawStream::Stderr {
             eprintln!("[{name}] {line}");
+        }
+        if let Some(note) = ev.and_then(agent_transport_error) {
+            transport_error = Some(note);
         }
     });
 
@@ -222,10 +239,16 @@ fn run_in(
                 Err(e) => fail(cost, format!("{RESULT_FILE} is not valid JSON: {e}")),
             }
         }
-        Err(_) => fail(
-            cost,
-            format!("turn ended without writing {RESULT_FILE} — nothing to grade"),
-        ),
+        Err(_) => match transport_error {
+            Some(note) => Attempt {
+                outcome: AttemptOutcome::Transport(note),
+                cost_usd: cost,
+            },
+            None => fail(
+                cost,
+                format!("turn ended without writing {RESULT_FILE} — nothing to grade"),
+            ),
+        },
     }
 }
 
@@ -236,11 +259,75 @@ fn fail(cost_usd: f64, note: String) -> Attempt {
     }
 }
 
+fn transport(note: String) -> Attempt {
+    Attempt {
+        outcome: AttemptOutcome::Transport(note),
+        cost_usd: 0.0,
+    }
+}
+
+fn agent_transport_error(event: &AgentEvent) -> Option<String> {
+    match event {
+        AgentEvent::Error {
+            error_type,
+            message,
+        } => Some(format!("{error_type}: {message}")),
+        AgentEvent::Result {
+            is_error: true,
+            error,
+            ..
+        } => Some(
+            error
+                .as_deref()
+                .unwrap_or("agent turn ended with an unspecified error")
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn task_worktree_name(name: &TaskName) -> String {
+    let digest = crucible_contract::artifact::content_digest(name.0.as_bytes());
+    format!("task-{}", digest.trim_start_matches("sha256:"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus, execute};
     use crate::plan::ir::{Join, Plan};
+
+    #[test]
+    fn isolation_worktree_names_do_not_collide_after_display_sanitization() {
+        let slash = task_worktree_name(&"review/a".into());
+        let dash = task_worktree_name(&"review-a".into());
+        assert_ne!(slash, dash);
+        assert!(slash.starts_with("task-"));
+        assert!(slash.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+
+    #[test]
+    fn explicit_agent_errors_are_transport_failures() {
+        let overloaded = AgentEvent::Error {
+            error_type: "overloaded".into(),
+            message: "try later".into(),
+        };
+        assert_eq!(
+            agent_transport_error(&overloaded).as_deref(),
+            Some("overloaded: try later")
+        );
+        let failed_result = AgentEvent::Result {
+            subtype: "success".into(),
+            is_error: true,
+            turns: 0,
+            cost_usd: 0.0,
+            error: Some("not logged in".into()),
+        };
+        assert_eq!(
+            agent_transport_error(&failed_result).as_deref(),
+            Some("not logged in")
+        );
+    }
 
     /// The counter litmus, plan-shaped: agent tasks run through the REAL `run_turn` path
     /// (`command` backend: real subprocess, no LLM, no mock), mutating a real git
@@ -252,10 +339,16 @@ mod tests {
             std::env::temp_dir().join(format!("crucible-plan-harness-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("toolbox/demo")).unwrap();
+        std::fs::write(dir.join("toolbox/demo/SKILL.md"), "# Demo\n").unwrap();
         std::fs::write(dir.join("value.txt"), "1\n").unwrap();
         std::fs::write(
             dir.join("bump.sh"),
-            "#!/bin/sh\nv=$(cat value.txt); v=$((v + 1)); echo \"$v\" > value.txt\n\
+            "#!/bin/sh\ncase \"$CRUCIBLE_PROMPT\" in\n\
+             *again*) test -f .agents/skills/demo/SKILL.md ;;\n\
+             *) test -f .claude/skills/demo/SKILL.md ;;\n\
+             esac\n\
+             v=$(cat value.txt); v=$((v + 1)); echo \"$v\" > value.txt\n\
              printf '{\"new_value\": %s}\\n' \"$v\" > PLAN_TASK_RESULT.json\n",
         )
         .unwrap();
@@ -277,6 +370,7 @@ mod tests {
             backend = "command"
             agent_cmd = "./bump.sh"
             goal = "raise the value"
+            toolbox_dir = "toolbox"
             [judge]
             measure_cmd = "cat value.txt"
             direction = "higher"
@@ -297,6 +391,7 @@ mod tests {
             name = "bump-2"
             kind = "agent"
             prompt = "raise it again"
+            harness = "hermes"
             depends_on = ["bump-1"]
             [[task]]
             name = "measure"
@@ -379,9 +474,6 @@ mod tests {
         )
     }
 
-    /// A review pass between the code node and the gate. The reward-hacked implementation
-    /// passes the frozen functional gate, so only the review can reject it; when it does,
-    /// the expensive downstream task must never dispatch.
     #[test]
     fn adversarial_review_gates_a_reward_hack_the_frozen_gate_cannot_see() {
         // 1. Clean implementation: the review approves and the whole chain runs.
@@ -451,6 +543,11 @@ mod tests {
         let ws = hacked.join("workspace");
         let src = std::fs::read_to_string(ws.join("solution.py")).unwrap();
         assert!(src.contains("return n in"), "the hack is on disk: {src}");
+        let policy = std::fs::read_to_string(ws.join("verdict_gate.sh")).unwrap();
+        assert!(
+            !policy.contains("gate replaced by implementer"),
+            "the manifest-owned policy gate must be restored after agent tampering: {policy}"
+        );
         let verify = std::process::Command::new("./verify.sh")
             .current_dir(&ws)
             .output()

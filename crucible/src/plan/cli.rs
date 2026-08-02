@@ -1,6 +1,6 @@
 //! The `crucible plan` CLI: `show` compiles and prints a plan; `run` executes one.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -32,7 +32,7 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
         p.budget.usd
     );
     if let Some(reason) = &p.reason {
-        out.push_str(&format!("replan reason: {reason}\n"));
+        out.push_str(&format!("reason: {reason}\n"));
     }
     let runnable = runnable_set(plan, &Substrate { caps: caps.clone() });
     for t in plan.tasks_topo() {
@@ -54,7 +54,7 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
             ),
             TaskKind::Command { command } => format!("command[{command}]"),
             TaskKind::TopK { k, .. } => format!("top_k[k={k}]"),
-            TaskKind::Engine(_) => t.task.label().to_string(),
+            TaskKind::Engine { .. } => t.task.label().to_string(),
         };
         out.push_str(&format!(
             "  {:<20} {:<28} needs={:<8} {} deps: {}{}\n",
@@ -86,21 +86,26 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
 pub fn render_mermaid(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
     let runnable = runnable_set(plan, &Substrate { caps: caps.clone() });
     let mut out = String::from("flowchart TD\n");
+    let ids: BTreeMap<_, _> = plan
+        .tasks_topo()
+        .enumerate()
+        .map(|(i, t)| (t.name.clone(), format!("t{i}")))
+        .collect();
     for t in plan.tasks_topo() {
         let ok = runnable.contains(&t.name);
         let (shape_open, shape_close, class) = match &t.task {
             TaskKind::Agent { .. } => ("([", "])", "agent"),
             TaskKind::Command { .. } => ("[", "]", "command"),
             TaskKind::TopK { .. } => ("{{", "}}", "reduce"),
-            TaskKind::Engine(_) => ("[[", "]]", "engine"),
+            TaskKind::Engine { .. } => ("[[", "]]", "engine"),
         };
         let detail = match &t.task {
             TaskKind::Agent { harness, model, .. } => format!(
                 "<br/>{}/{}",
-                harness.as_deref().unwrap_or("default"),
-                model.as_deref().unwrap_or("default")
+                mermaid_label(harness.as_deref().unwrap_or("default")),
+                mermaid_label(model.as_deref().unwrap_or("default"))
             ),
-            TaskKind::Command { .. } | TaskKind::Engine(_) => String::new(),
+            TaskKind::Command { .. } | TaskKind::Engine { .. } => String::new(),
             TaskKind::TopK { k, .. } => format!("<br/>k={k}"),
         };
         let marks = format!(
@@ -110,15 +115,11 @@ pub fn render_mermaid(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
         );
         out.push_str(&format!(
             "    {id}{shape_open}\"{name}{detail}{marks}\"{shape_close}:::{class}\n",
-            id = mermaid_id(&t.name.0),
-            name = t.name.0,
+            id = ids[&t.name],
+            name = mermaid_label(&t.name.0),
         ));
         for d in &t.depends_on {
-            out.push_str(&format!(
-                "    {} --> {}\n",
-                mermaid_id(&d.0),
-                mermaid_id(&t.name.0)
-            ));
+            out.push_str(&format!("    {} --> {}\n", ids[d], ids[&t.name]));
         }
     }
     out.push_str(
@@ -130,7 +131,7 @@ pub fn render_mermaid(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
     out
 }
 
-/// The plan's admission record on the wire: version, replan reason, budget, full graph.
+/// Serialize an admitted plan for the event stream.
 pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::session::SessionEvent {
     let p = plan.plan();
     crate::session::SessionEvent::PlanAdmitted {
@@ -177,13 +178,12 @@ pub(crate) fn task_result_event(
     }
 }
 
-/// A mermaid-safe node id: alphanumerics kept, everything else folded to `_`.
-fn mermaid_id(name: &str) -> String {
-    let id: String = name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    format!("t_{id}")
+fn mermaid_label(name: &str) -> String {
+    name.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace(['\r', '\n'], " ")
 }
 
 pub fn show(path: &Path, caps: &BTreeSet<String>, mermaid: bool, render_img: bool) -> Result<()> {
@@ -368,17 +368,35 @@ mod tests {
         let plan = Plan::from_toml_str(SRC).unwrap().validate().unwrap();
         let out = render_mermaid(&plan, &BTreeSet::new());
         assert!(out.starts_with("flowchart TD\n"));
-        assert!(
-            out.contains(r#"t_propose(["propose"#),
-            "agent node shape: {out}"
-        );
-        assert!(out.contains("t_propose --> t_measure"), "edge: {out}");
+        assert!(out.contains(r#"t0(["propose"#), "agent node shape: {out}");
+        assert!(out.contains("t0 --> t1"), "edge: {out}");
         assert!(
             out.contains('⛔'),
             "gpu-gated task marked unrunnable: {out}"
         );
         let with_caps = render_mermaid(&plan, &["gpu".to_string()].into());
         assert!(!with_caps.contains('⛔'));
+    }
+
+    #[test]
+    fn mermaid_uses_distinct_internal_ids_for_similar_task_names() {
+        let src = r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "review/a"
+            kind = "command"
+            command = "true"
+            [[task]]
+            name = "review-a"
+            kind = "command"
+            command = "true"
+        "#;
+        let plan = Plan::from_toml_str(src).unwrap().validate().unwrap();
+        let out = render_mermaid(&plan, &BTreeSet::new());
+        assert!(out.contains("t0[\"review/a\"]"));
+        assert!(out.contains("t1[\"review-a\"]"));
     }
 
     #[test]

@@ -1,12 +1,13 @@
 # Work graphs
 
 A **plan** is a versioned DAG of **tasks** that a deterministic executor runs. Tasks are agent
-turns, frozen commands, or engine-owned reducers. The executor owns advancement: a task never
+turns, plan-authored commands, or engine-owned reducers. The executor owns advancement: a task never
 decides what runs next.
 
-Plans come from three places. The engine builds them from templates (the loop iteration, the
-wide tournament). A human or a pack authors them as TOML. An agent emits one as JSON, which is
-validated and admitted before anything runs.
+Today, the engine supplies a default loop graph and a wide-tournament template, and a human or
+pack can supply TOML or JSON through the `plan` CLI. Workflow admission separates authorable
+topology from authority: an orchestrator must advertise the workflow type and engine operations
+it can safely execute.
 
 ## Running a plan
 
@@ -30,11 +31,11 @@ crucible plan run --file plan.toml --agent-cmd ./role.sh
 ## File format
 
 ```toml
-version = 1                 # >= 1. A replan is a new version and must set `reason`.
-# reason = "..."            # required when version > 1
+version = 1                 # the only format version accepted today
+# reason = "..."            # reserved for a future replan protocol
 
 [budget]
-usd = 5.0                   # required, positive. Enforced, not advisory.
+usd = 5.0                   # required, positive; execution fails closed on overrun
 
 [[task]]
 name = "propose"            # unique within the plan
@@ -67,11 +68,19 @@ depends_on = ["measure"]
 | Kind | What it runs |
 | --- | --- |
 | `agent` | One agent turn. `harness` / `model` / `effort` override the manifest's `[agent]` defaults per task. |
-| `command` | A frozen command, same output contract as `measure_cmd`. |
+| `command` | A plan-authored command, with the same output contract as `measure_cmd`. |
 | `top_k` | Engine-owned reducer: keep the `k` best inputs by their `score` field. Needs at least one dependency. |
+| `engine` | Capability-owned operation (`propose`, `apply`, `measure`, `decide`, or `measure_diff`). Only an admitting orchestrator can execute it. |
 
-The loop's own stages (`apply`, `measure`, `decide`) are engine-constructed and cannot be
-authored. Packs and agents never sequence the `World` or the `Judge` directly.
+Serialization is not authority. A workflow may author and sequence engine nodes, but admission
+requires matching capabilities such as `workflow.autoresearch`, `engine.apply`, and
+`engine.measure`. The generic plan runner rejects them because it owns neither a `World` nor a
+frozen `Judge`.
+
+A command string is not a trust boundary by itself. If it invokes a script that must remain
+trusted after an agent task edits the workspace, declare that script as a frozen
+`[[workspace.inject]]` in the manifest. The plan runner restores frozen injects in the task's
+actual workspace before every task, including isolated worktrees.
 
 ### Task output
 
@@ -81,7 +90,8 @@ A task's output is JSON and becomes its dependents' input.
   failure is a transport failure. Upstream outputs arrive as `CRUCIBLE_INPUTS` (a JSON object
   keyed by task name), plus `CRUCIBLE_TASK`.
 - `agent` under `--manifest`: the turn writes a single JSON object to `PLAN_TASK_RESULT.json`
-  in the workspace root. No file, no pass.
+  in the workspace root. A missing file after a normal turn is a measured failure; an explicit
+  spawn, harness, or stream error is a transport failure and follows the retry policy.
 - `agent` under `--agent-cmd`: the stand-in receives `CRUCIBLE_PROMPT`, `CRUCIBLE_HARNESS`,
   `CRUCIBLE_MODEL`, `CRUCIBLE_EFFORT`, and returns JSON on its last stdout line.
 
@@ -104,8 +114,9 @@ blocked. An advisory failure blocks only its dependents.
 **Retry is not recheck.** Transport failures retry, bounded (2 by default). A measured failure
 never reruns: a task that failed, failed.
 
-**Budget.** Spending past `budget.usd` blocks the remaining tasks. It is a ceiling, not a
-target.
+**Budget.** Cost is known only after an attempt completes, so an in-flight attempt may report a
+total above `budget.usd`. Any overrun invalidates the plan and blocks all further dispatch and
+retries. Reaching the budget exactly is valid only when no further retry or task is needed.
 
 ### `needs`
 
@@ -134,11 +145,57 @@ lossy fan-out, or for a gate over reviewers where one being advisory must not st
 
 ## The loop as a plan
 
-`--graph-loop` runs each loop iteration as a canonical plan:
+`--graph-loop` runs each loop iteration as a capability-admitted `autoresearch` workflow. With no
+authored workflow, the default expands to ordinary tasks:
 
 ```
-propose (agent) -> apply -> measure -> decide
+propose (engine) -> apply -> measure -> decide
 ```
+
+Task names and intervening topology are author-defined. An `autoresearch` result must be a decision
+fed by a frozen measurement with apply and proposal ancestors. A `custom` workflow has no such
+shape requirement; the outer orchestrator only admits it when it advertises `workflow.custom`.
+
+```toml
+[workflow]
+type = "autoresearch"
+result = "keep-if-better"
+
+[[workflow.task]]
+name = "invent"
+kind = "engine"
+op = "propose"
+
+[[workflow.task]]
+name = "review"
+kind = "command"
+command = "./review.sh"
+depends_on = ["invent"]
+
+[[workflow.task]]
+name = "deploy-preview"
+kind = "engine"
+op = "apply"
+depends_on = ["review"]
+
+[[workflow.task]]
+name = "benchmark"
+kind = "engine"
+op = "measure"
+depends_on = ["deploy-preview"]
+
+[[workflow.task]]
+name = "keep-if-better"
+kind = "engine"
+op = "decide"
+source = "benchmark"
+depends_on = ["benchmark"]
+```
+
+The corresponding admission needs `workflow.autoresearch`, `engine.propose`, `engine.apply`,
+`engine.measure`, and `engine.decide`. A custom orchestrator can instead admit `type = "custom"`
+and any subset of operations it implements. Task-level `needs` still controls where an admitted
+task can run; workflow capabilities control what the orchestrator is authorized to mean.
 
 Same decisions and same session events as the default path, plus additive `plan_admitted` and
 `task_result` lines. Cross-round state, keep/discard, and every between-round control (parking,
