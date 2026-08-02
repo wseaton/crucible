@@ -308,6 +308,13 @@ fn fail(cost_usd: f64, note: String) -> Attempt {
     }
 }
 
+fn transport(note: String) -> Attempt {
+    Attempt {
+        outcome: AttemptOutcome::Transport(note),
+        cost_usd: 0.0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The wide tournament as a template: N isolated propose tasks fan out in
 // parallel worktrees, their diffs are scored serially on the shared deployment
@@ -694,6 +701,14 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
                 let Some(id) = candidate_id(&task.name) else {
                     return fail(0.0, format!("task {} has no candidate id", task.name));
                 };
+                let snapshot = match crate::plan::worktree::snapshot(&self.p.workspace) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        return transport(format!(
+                            "capturing workspace snapshot failed: {error:#}"
+                        ));
+                    }
+                };
                 wide_propose(
                     self.args,
                     &self.p.workspace,
@@ -701,6 +716,7 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
                     self.p.skills.clone(),
                     id,
                     prompt,
+                    &snapshot,
                 )
             }
             TaskKind::Engine(EngineOp::MeasureDiff) => self.measure_diff(task, inputs),
@@ -719,6 +735,14 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
         let wide_dir = self.wide_dir.clone();
         let skills = self.p.skills.clone();
         let args = self.args;
+        // Every candidate starts from one snapshot.
+        let snapshot = match crate::plan::worktree::snapshot(&workspace) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let note = format!("capturing workspace snapshot failed: {error:#}");
+                return batch.iter().map(|_| transport(note.clone())).collect();
+            }
+        };
         std::thread::scope(|s| {
             let handles: Vec<_> = batch
                 .iter()
@@ -727,6 +751,7 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
                     let wide_dir = wide_dir.clone();
                     let skills = skills.clone();
                     let args = args.clone();
+                    let snapshot = snapshot.as_str();
                     let (id, prompt) = match (&b.task.task, candidate_id(&b.task.name)) {
                         (TaskKind::Agent { prompt, .. }, Some(id)) => (id, prompt.clone()),
                         _ => (u32::MAX, String::new()),
@@ -735,7 +760,7 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
                         if id == u32::MAX {
                             return fail(0.0, "non-agent task in a propose batch".to_string());
                         }
-                        wide_propose(&args, &workspace, &wide_dir, skills, id, &prompt)
+                        wide_propose(&args, &workspace, &wide_dir, skills, id, &prompt, snapshot)
                     })
                 })
                 .collect();
@@ -761,13 +786,14 @@ fn wide_propose(
     skills: Option<PathBuf>,
     id: u32,
     prompt: &str,
+    snapshot: &str,
 ) -> Attempt {
     if STOP.load(Ordering::SeqCst) {
         return pass(serde_json::json!({ "diff": "" }));
     }
     let worktree = wide_dir.join(format!("candidate-{id}"));
-    if let Err(e) = crate::plan::worktree::setup(workspace, &worktree) {
-        return fail(0.0, format!("worktree setup failed: {e:#}"));
+    if let Err(e) = crate::plan::worktree::setup_with(workspace, &worktree, snapshot) {
+        return transport(format!("worktree setup failed: {e:#}"));
     }
     let cand_paths = Paths {
         workspace: worktree.clone(),
@@ -783,7 +809,10 @@ fn wide_propose(
     let _cost = agent::run_turn(args, &cand_paths, prompt, false, |_line, _stream, _ev| {});
     let diff = crate::plan::worktree::capture_diff(&worktree);
     let _ = std::fs::remove_dir_all(&worktree);
-    pass(serde_json::json!({ "diff": diff }))
+    match diff {
+        Ok(diff) => pass(serde_json::json!({ "diff": diff })),
+        Err(error) => transport(format!("capturing candidate diff failed: {error:#}")),
+    }
 }
 
 /// The numeric suffix of `propose-{id}` / `measure-{id}` task names.
