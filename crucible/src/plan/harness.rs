@@ -47,7 +47,13 @@ impl TaskRunner for HarnessRunner {
             )];
         }
         // One capture for the batch: every worktree sees the same candidate.
-        let snapshot = crate::plan::worktree::snapshot(&self.paths.workspace);
+        let snapshot = match crate::plan::worktree::snapshot(&self.paths.workspace) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let note = format!("capturing workspace snapshot failed: {error:#}");
+                return batch.iter().map(|_| transport(note.clone())).collect();
+            }
+        };
         std::thread::scope(|scope| {
             let handles: Vec<_> = batch
                 .iter()
@@ -89,7 +95,7 @@ fn run_task(
     // coding tasks whose diff has to survive (the wide tournament carries those out itself).
     let root = paths.state.join("plan-iso");
     if let Err(e) = std::fs::create_dir_all(&root) {
-        return fail(0.0, format!("creating the isolation root failed: {e}"));
+        return transport(format!("creating the isolation root failed: {e}"));
     }
     let slug: String = task
         .name
@@ -103,7 +109,7 @@ fn run_task(
         None => crate::plan::worktree::setup(&paths.workspace, &worktree),
     };
     if let Err(e) = prepared {
-        return fail(0.0, format!("worktree setup failed: {e:#}"));
+        return transport(format!("worktree setup failed: {e:#}"));
     }
     let iso = Paths {
         workspace: worktree.clone(),
@@ -215,6 +221,13 @@ fn fail(cost_usd: f64, note: String) -> Attempt {
     Attempt {
         outcome: AttemptOutcome::Fail(note),
         cost_usd,
+    }
+}
+
+fn transport(note: String) -> Attempt {
+    Attempt {
+        outcome: AttemptOutcome::Transport(note),
+        cost_usd: 0.0,
     }
 }
 

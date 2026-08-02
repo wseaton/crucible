@@ -6,12 +6,34 @@
 //! `isolation = "worktree"`.
 
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Output};
 
 use anyhow::{Context, Result};
 
+#[derive(Debug)]
+struct GitFailure {
+    operation: String,
+    status: ExitStatus,
+    stderr: String,
+}
+
+impl std::fmt::Display for GitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} failed with {}: {}",
+            self.operation,
+            self.status,
+            self.stderr.trim()
+        )
+    }
+}
+
+impl std::error::Error for GitFailure {}
+
 /// The workspace's uncommitted state, captured once for a whole fan-out: one tree scan
 /// instead of N, and every candidate demonstrably starts from the same view.
-pub(crate) fn snapshot(workspace: &Path) -> String {
+pub(crate) fn snapshot(workspace: &Path) -> Result<String> {
     capture_diff(workspace)
 }
 
@@ -21,7 +43,8 @@ pub(crate) fn snapshot(workspace: &Path) -> String {
 ///
 /// Takes its own snapshot; concurrent callers should share one via [`setup_with`].
 pub(crate) fn setup(workspace: &Path, dest: &Path) -> Result<()> {
-    setup_with(workspace, dest, &snapshot(workspace))
+    let snapshot = snapshot(workspace).context("capturing the workspace before isolation")?;
+    setup_with(workspace, dest, &snapshot)
 }
 
 /// [`setup`] against a snapshot the caller already took.
@@ -39,23 +62,13 @@ pub(crate) fn setup_with(workspace: &Path, dest: &Path, snapshot: &str) -> Resul
         ])
         .output()
         .context("git clone --local for a task worktree")?;
-    if !status.status.success() {
-        anyhow::bail!(
-            "git clone --local failed: {}",
-            String::from_utf8_lossy(&status.stderr)
-        );
-    }
+    require_success("git clone --local", &status)?;
     // Check out HEAD so the task has a working tree.
     let checkout = std::process::Command::new("git")
         .args(["-C", &dest.to_string_lossy(), "checkout", "HEAD"])
         .output()
         .context("git checkout HEAD in a task worktree")?;
-    if !checkout.status.success() {
-        anyhow::bail!(
-            "git checkout in a task worktree failed: {}",
-            String::from_utf8_lossy(&checkout.stderr)
-        );
-    }
+    require_success("git checkout HEAD", &checkout)?;
     // A clone only carries committed state, but isolation has to mean "the workspace as it
     // stands right now": an upstream task's uncommitted edits are exactly what the isolated
     // task is usually there to look at. Carry the working tree over as a patch.
@@ -68,28 +81,46 @@ pub(crate) fn setup_with(workspace: &Path, dest: &Path, snapshot: &str) -> Resul
 /// `git add -A` runs against a throwaway index seeded from the real one, so this reads
 /// without writing: no `.git/index.lock` contention between concurrent callers, and no
 /// staging the caller's workspace behind its back.
-pub(crate) fn capture_diff(worktree: &Path) -> String {
-    let scratch = match tempfile::tempdir() {
-        Ok(scratch) => scratch,
-        Err(_) => return String::new(),
-    };
+pub(crate) fn capture_diff(worktree: &Path) -> Result<String> {
+    let scratch = tempfile::tempdir().context("creating a temporary Git index directory")?;
     let index = scratch.path().join("index");
     // A repo with no commits yet has no index; starting from an absent one is fine.
-    if let Ok(real) = git_path(worktree, "index") {
-        let _ = std::fs::copy(real, &index);
+    let real = git_path(worktree, "index")?;
+    match std::fs::copy(&real, &index) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("copying Git index from {}", real.display()));
+        }
     }
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .args(["-C", &worktree.to_string_lossy()])
-            .args(args)
-            .env("GIT_INDEX_FILE", &index)
-            .output()
-    };
-    let _ = git(&["add", "-A"]);
-    match git(&["diff", "--cached", "--binary"]) {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-        Err(_) => String::new(),
+    git_with_index(worktree, &index, &["add", "-A"])?;
+    let output = git_with_index(worktree, &index, &["diff", "--cached", "--binary"])?;
+    String::from_utf8(output.stdout).context("captured Git diff is not UTF-8")
+}
+
+fn git_with_index(worktree: &Path, index: &Path, args: &[&str]) -> Result<Output> {
+    let operation = format!("git {}", args.join(" "));
+    let output = std::process::Command::new("git")
+        .args(["-C", &worktree.to_string_lossy()])
+        .args(args)
+        .env("GIT_INDEX_FILE", index)
+        .output()
+        .with_context(|| format!("spawning {operation}"))?;
+    require_success(&operation, &output)?;
+    Ok(output)
+}
+
+fn require_success(operation: &str, output: &Output) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
     }
+    Err(GitFailure {
+        operation: operation.to_string(),
+        status: output.status,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+    .into())
 }
 
 /// Resolve a path inside the git dir; a linked worktree's is not `<worktree>/.git`.
@@ -99,10 +130,12 @@ fn git_path(worktree: &Path, name: &str) -> Result<PathBuf> {
         .arg(name)
         .output()
         .context("git rev-parse --git-path")?;
-    if !out.status.success() {
-        anyhow::bail!("git rev-parse --git-path {name} failed");
-    }
-    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    require_success("git rev-parse --git-path", &out)?;
+    let path = PathBuf::from(
+        String::from_utf8(out.stdout)
+            .context("git rev-parse --git-path returned non-UTF-8")?
+            .trim(),
+    );
     Ok(if path.is_absolute() {
         path
     } else {
@@ -135,12 +168,7 @@ pub(crate) fn apply(main_ws: &Path, diff: &str) -> Result<()> {
     }
 
     let output = apply.wait_with_output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git apply failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    require_success("git apply", &output)?;
     Ok(())
 }
 
@@ -190,7 +218,7 @@ mod tests {
         std::fs::write(root.join("committed.txt"), "changed\n").unwrap();
 
         let staged_before = staged(&root);
-        let diff = capture_diff(&root);
+        let diff = capture_diff(&root).unwrap();
 
         assert!(diff.contains("untracked.txt"), "untracked file: {diff}");
         assert!(diff.contains("committed.txt"), "modified file: {diff}");
@@ -245,7 +273,7 @@ mod tests {
         );
         std::fs::write(workspace.join("pending.txt"), "uncommitted-evidence\n").unwrap();
 
-        let snapshot = snapshot(&workspace);
+        let snapshot = snapshot(&workspace).unwrap();
         assert!(
             !snapshot.is_empty(),
             "the snapshot carries the pending file"
@@ -267,6 +295,20 @@ mod tests {
                 "worktree {i} is missing the candidate's uncommitted state"
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn capture_failure_is_reported_instead_of_becoming_an_empty_diff() {
+        let root =
+            std::env::temp_dir().join(format!("crucible-wt-not-a-repo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let error = capture_diff(&root).unwrap_err().to_string();
+
+        assert!(error.contains("git rev-parse --git-path"), "{error}");
+        assert!(error.contains("failed with"), "{error}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
