@@ -20,6 +20,8 @@ toml = "0.8"
 # sandboxed [agent] backend); the deserialize-only `Manifest` can't round-trip, so a targeted edit
 # keeps the agent's authored comments. Already in the tree as `toml`'s own backing crate.
 toml_edit = "0.22"
+# Parse the scope-time Starlark subset without a runtime evaluator.
+starlark_syntax = "0.14.2"
 ctrlc = "3"
 git2.workspace = true
 fs_extra = "1.3.0"

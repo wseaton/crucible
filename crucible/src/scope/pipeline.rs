@@ -299,7 +299,7 @@ impl Propose {
             }
 
             let judge_block = read_judge_block(&ctx.manifest_path);
-            match validate_round(&ctx.manifest_path) {
+            match compile_and_validate_round(&ctx.manifest_path) {
                 RoundVerdict::Passed(outcome) => {
                     ctx.refine_rounds.push(RoundRecord {
                         round,
@@ -392,7 +392,7 @@ impl Propose {
         // Re-validate WHILE the check-populated workspace still exists, so the probe reuses it
         // instead of cloning the freshly-pinned remote `[repo]` (a network round-trip the freeze
         // doesn't need). A failure here is a rewrite bug, fail the scope loudly, never ship it.
-        match validate_round(&ctx.manifest_path) {
+        match compile_and_validate_round(&ctx.manifest_path) {
             RoundVerdict::Passed(outcome) => ctx.check_outcome = Some(outcome),
             RoundVerdict::Failed(evidence) => bail!(
                 "the frozen pack failed re-validation after the freeze rewrite for {}: {}",
@@ -524,7 +524,7 @@ impl Propose {
             }
 
             let judge_block = read_judge_block(&ctx.manifest_path);
-            match validate_round(&ctx.manifest_path) {
+            match compile_and_validate_round(&ctx.manifest_path) {
                 RoundVerdict::Failed(ev) => {
                     ctx.refine_rounds.push(RoundRecord {
                         round: refine_round,
@@ -706,17 +706,20 @@ enum RoundVerdict {
     Failed(FailureEvidence),
 }
 
-/// Validate a proposed pack for one refine round: the structural preconditions first (a parseable
-/// manifest with a `[judge.selftest]` whose `runs` meets the pipeline floor), then the full
-/// `crucible check` (contract probe + self-test discrimination). Classifies any failure into the
-/// stage-tagged [`FailureEvidence`] the refine turn is handed.
-fn validate_round(manifest_path: &Path) -> RoundVerdict {
+/// Compile a sibling workflow, then validate one refine round. Compilation materializes the
+/// manifest even when validation fails.
+fn compile_and_validate_round(manifest_path: &Path) -> RoundVerdict {
     if !manifest_path.exists() {
         return RoundVerdict::Failed(FailureEvidence::Structure {
             detail: format!(
                 "no {} was written — the turn produced no pack to validate",
                 MANIFEST_FILE
             ),
+        });
+    }
+    if let Err(error) = crate::plan::starlark::materialize_sibling_manifest(manifest_path) {
+        return RoundVerdict::Failed(FailureEvidence::Structure {
+            detail: format!("workflow.star did not compile into [[workflow.task]]: {error:#}"),
         });
     }
     let m = match manifest::Manifest::load(manifest_path) {
@@ -907,6 +910,8 @@ impl Stage for Validate {
     }
 
     fn run(&self, ctx: &mut ScopeCtx) -> Result<String> {
+        crate::plan::starlark::materialize_sibling_manifest(&ctx.manifest_path)
+            .context("compiling sibling workflow.star before scope validation")?;
         // On the `--propose` path the refine loop already validated the winning pack and stored its
         // outcome; reuse it instead of re-running the whole check (contract probe + self-test). On
         // the hand-written path there's no stored outcome, so run it now. Either way the outcome
@@ -1785,6 +1790,31 @@ mod tests {
     }
 
     #[test]
+    fn hand_authored_scope_materializes_workflow_source_before_freeze() {
+        let dir = tempdir("hand-workflow");
+        scaffold_pack(&dir);
+        fs::create_dir_all(dir.join("prompts")).unwrap();
+        fs::write(dir.join("prompts/review.md"), "Review the candidate.\n").unwrap();
+        fs::write(
+            dir.join("workflow.star"),
+            "workflow([agent(name = \"review\", prompt = prompt_file(\"prompts/review.md\"), required = False)])\n",
+        )
+        .unwrap();
+
+        let report = execute(&dir, None, None, false, None);
+        assert!(
+            report.stages.iter().all(|stage| stage.passed),
+            "{:?}",
+            report.stages
+        );
+        let manifest = fs::read_to_string(dir.join(MANIFEST_FILE)).unwrap();
+        assert!(manifest.contains("[[workflow.task]]"), "{manifest}");
+        assert!(manifest.contains("Review the candidate."), "{manifest}");
+        assert!(report.digest.is_some(), "compiled manifest must freeze");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn stage_2_failure_stops_the_pipeline_before_freeze() {
         let dir = tempdir("broken");
         broken_pack(&dir);
@@ -1805,6 +1835,26 @@ mod tests {
             "no SCOPE.md on a failed validate stage"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workflow_compile_failure_is_scope_structure_evidence() {
+        let dir = tempdir("workflow-structure");
+        scaffold_pack(&dir);
+        fs::write(
+            dir.join("workflow.star"),
+            "workflow([agent(name = 'review', prompt = prompt_file('../escape.md'))])\n",
+        )
+        .unwrap();
+
+        let RoundVerdict::Failed(FailureEvidence::Structure { detail }) =
+            compile_and_validate_round(&dir.join(MANIFEST_FILE))
+        else {
+            panic!("bad workflow source must be structure evidence")
+        };
+        assert!(detail.contains("workflow.star did not compile"), "{detail}");
+        assert!(detail.contains("may not contain `..`"), "{detail}");
         let _ = fs::remove_dir_all(&dir);
     }
 

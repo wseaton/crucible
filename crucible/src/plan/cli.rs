@@ -8,6 +8,22 @@ use anyhow::{Context, Result};
 use crate::plan::exec::{Substrate, runnable_set};
 use crate::plan::ir::{Plan, TaskKind, ValidPlan};
 
+/// Compile scope-time workflow authoring syntax. JSON on stdout is stable enough for a
+/// checked-in golden; `--manifest` additionally materializes the runtime TOML authority.
+pub fn compile_workflow(file: &Path, manifest: Option<&Path>) -> Result<()> {
+    let compiled = match manifest {
+        Some(manifest) => crate::plan::starlark::materialize_manifest(file, manifest)?,
+        None => {
+            crate::plan::starlark::compile_file(file, crate::plan::starlark::parent_or_cwd(file))?
+        }
+    };
+    for prompt_file in &compiled.prompt_files {
+        eprintln!("embedded prompt: {}", prompt_file.display());
+    }
+    print!("{}", compiled.canonical_json);
+    Ok(())
+}
+
 /// Read TOML (`.toml`) or JSON (anything else: the `PLAN.json` sentinel shape),
 /// validate, and return the frozen plan.
 pub fn load(path: &Path) -> Result<ValidPlan> {

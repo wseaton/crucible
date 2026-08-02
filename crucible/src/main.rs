@@ -296,6 +296,15 @@ pub(crate) enum Cmd {
 /// `crucible plan <show|run>`: compile and inspect a plan, or execute one.
 #[derive(clap::Subcommand)]
 pub(crate) enum PlanAction {
+    /// Compile `workflow.star`; optionally materialize it into a manifest.
+    CompileWorkflow {
+        /// Starlark workflow source (conventionally `<pack>/workflow.star`).
+        #[arg(long)]
+        file: PathBuf,
+        /// Manifest to materialize in place for validation and freeze.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
     /// Print the compiled plan (tasks in dependency-first order) and the truncation verdict
     /// for the given substrate caps. TOML by `.toml` extension, JSON otherwise.
     Show {
