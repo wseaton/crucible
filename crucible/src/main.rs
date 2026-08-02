@@ -296,8 +296,7 @@ pub(crate) enum Cmd {
 /// `crucible deploy <render|apply>`: emit the deployment YAML, or render-and-`kubectl apply`.
 #[derive(clap::Subcommand)]
 pub(crate) enum PlanAction {
-    /// Compile a scope-authored `workflow.star` into canonical workflow JSON. With
-    /// `--manifest`, also replace that manifest's generated `[[workflow.task]]` block.
+    /// Compile `workflow.star`; optionally materialize it into a manifest.
     CompileWorkflow {
         /// Starlark workflow source (conventionally `<pack>/workflow.star`).
         #[arg(long)]
