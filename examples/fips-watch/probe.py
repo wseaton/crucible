@@ -8,11 +8,16 @@ from pathlib import Path
 
 
 def tree(args: list[str]) -> tuple[int, str]:
+    env = os.environ.copy()
+    toolchain = Path("RUST_TOOLCHAIN").read_text().strip()
+    if toolchain:
+        env["RUSTUP_TOOLCHAIN"] = toolchain
     proc = subprocess.run(
         ["cargo", "tree", "-e", "normal", *args],
         capture_output=True,
         text=True,
         cwd="checkout",
+        env=env,
     )
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
