@@ -83,18 +83,6 @@ struct UsageFields {
 }
 
 #[derive(Deserialize)]
-struct MsgDeltaEvent {
-    #[serde(default)]
-    usage: Option<UsageDeltaFields>,
-}
-
-#[derive(Deserialize)]
-struct UsageDeltaFields {
-    #[serde(default)]
-    output_tokens: u64,
-}
-
-#[derive(Deserialize)]
 struct ErrorEvt<'a> {
     #[serde(borrow)]
     error: ErrInfo<'a>,
@@ -298,14 +286,8 @@ impl StreamJsonParser {
                 }
             }
             "message_delta" => {
-                let Some(event_str) = extract_event_json(line) else {
-                    return;
-                };
-                if let Ok(evt) = serde_json::from_str::<MsgDeltaEvent>(event_str)
-                    && let Some(usage) = evt.usage
-                    && usage.output_tokens > 0
-                {
-                    self.output = usage.output_tokens;
+                if let Some(tokens) = extract_output_tokens(line) {
+                    self.output = tokens;
                     self.maybe_emit_tokens(out);
                 }
             }
@@ -473,6 +455,26 @@ fn inner_event_type(line: &str) -> Option<&str> {
     let val_start = pos + NEEDLE.len();
     let val_end = val_start + bytes[val_start..].iter().position(|&b| b == b'"')?;
     Some(&line[val_start..val_end])
+}
+
+/// Extract output_tokens from a message_delta line via byte scanning.
+fn extract_output_tokens(line: &str) -> Option<u64> {
+    const NEEDLE: &[u8] = b"\"output_tokens\":";
+    let bytes = line.as_bytes();
+    let pos = bytes
+        .windows(NEEDLE.len())
+        .position(|w| w == NEEDLE)?;
+    let val_start = pos + NEEDLE.len();
+    let val_end = val_start
+        + bytes[val_start..]
+            .iter()
+            .position(|b| !b.is_ascii_digit())?;
+    if val_start == val_end {
+        return None;
+    }
+    // Safe: we verified all bytes are ASCII digits
+    let s = &line[val_start..val_end];
+    s.parse().ok().filter(|&v: &u64| v > 0)
 }
 
 /// Extract the delta type and content string from a content_block_delta event JSON.
