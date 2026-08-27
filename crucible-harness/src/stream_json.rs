@@ -457,8 +457,15 @@ impl StreamJsonParser {
 /// Extract the inner event type from a stream_event line without finding event boundaries.
 /// Looks for `"event":{"type":"` which is at a fixed position in the stream_event format.
 fn inner_event_type(line: &str) -> Option<&str> {
-    const NEEDLE: &[u8] = b"\"event\":{\"type\":\"";
     let bytes = line.as_bytes();
+    // Fixed layout: {"type":"stream_event","event":{"type":"...
+    //                                        byte 31^       ^byte 40
+    if bytes.len() > 41 && &bytes[31..40] == b"{\"type\":\"" {
+        let val_end = 40 + bytes[40..].iter().position(|&b| b == b'"')?;
+        return Some(&line[40..val_end]);
+    }
+    // Fallback: scan for the pattern
+    const NEEDLE: &[u8] = b"\"event\":{\"type\":\"";
     let search_end = bytes.len().min(50);
     let pos = bytes[..search_end]
         .windows(NEEDLE.len())
