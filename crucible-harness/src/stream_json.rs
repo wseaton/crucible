@@ -164,22 +164,29 @@ impl StreamJsonParser {
     /// Decode one line of claude `stream-json`, returning every [`AgentEvent`] it completed.
     pub fn push(&mut self, line: &str) -> Vec<AgentEvent> {
         let mut out = Vec::new();
+        self.push_into(line, &mut out);
+        out
+    }
+
+    /// Like [`push`](Self::push) but appends events to a caller-owned buffer,
+    /// avoiding a per-line allocation.
+    pub fn push_into(&mut self, line: &str, out: &mut Vec<AgentEvent>) {
         let line = line.trim();
         if line.is_empty() {
-            return out;
+            return;
         }
 
         match quick_type(line) {
             Some("assistant") | Some("rate_limit_event") => {}
-            Some("stream_event") => self.stream_event_fast(line, &mut out),
+            Some("stream_event") => self.stream_event_fast(line, out),
             Some("system") => {
                 if let Ok(msg) = serde_json::from_str::<Value>(line) {
-                    self.system(&msg, &mut out);
+                    self.system(&msg, out);
                 }
             }
             Some("result") => {
                 if let Ok(msg) = serde_json::from_str::<Value>(line) {
-                    self.end_block(&mut out);
+                    self.end_block(out);
                     let is_error = bool_field(&msg, "is_error");
                     let error = is_error
                         .then(|| {
@@ -204,13 +211,12 @@ impl StreamJsonParser {
             }
             Some("user") => {
                 if let Ok(msg) = serde_json::from_str::<Value>(line) {
-                    self.tool_results(&msg, &mut out);
+                    self.tool_results(&msg, out);
                 }
             }
             Some(_) => out.push(raw(line)),
             None => out.push(raw(line)),
         }
-        out
     }
 
     /// `system/init` -> [`AgentEvent::Init`]; `system/api_retry` -> [`AgentEvent::Retry`].
@@ -230,21 +236,18 @@ impl StreamJsonParser {
         }
     }
 
-    /// Fast-path dispatch for stream_event lines. Extracts the event JSON boundaries
-    /// via byte scanning (avoiding a full parse of session_id/uuid/etc), then dispatches
-    /// on the inner event type with zero-copy typed deserialization.
+    /// Fast-path dispatch for stream_event lines. For the hottest path
+    /// (content_block_delta), extracts the delta directly from the line without
+    /// isolating the event JSON first. For other event types, falls back to
+    /// brace-tracking extraction + typed deserialization.
     fn stream_event_fast(&mut self, line: &str, out: &mut Vec<AgentEvent>) {
-        let Some(event_str) = extract_event_json(line) else {
+        let Some(inner_type) = inner_event_type(line) else {
             return;
         };
 
-        let Some(event_type) = quick_type(event_str) else {
-            return;
-        };
-
-        match event_type {
+        match inner_type {
             "content_block_delta" => {
-                if let Some((delta_type, content)) = extract_delta(event_str) {
+                if let Some((delta_type, content)) = extract_delta(line) {
                     match delta_type {
                         "text_delta" => self.buffer(TextKind::Text, &content, out),
                         "thinking_delta" => self.buffer(TextKind::Thinking, &content, out),
@@ -254,6 +257,9 @@ impl StreamJsonParser {
                 }
             }
             "content_block_start" => {
+                let Some(event_str) = extract_event_json(line) else {
+                    return;
+                };
                 let Ok(evt) = serde_json::from_str::<CbStartEvent>(event_str) else {
                     return;
                 };
@@ -282,6 +288,9 @@ impl StreamJsonParser {
             }
             "content_block_stop" => self.end_block(out),
             "message_start" => {
+                let Some(event_str) = extract_event_json(line) else {
+                    return;
+                };
                 if let Ok(evt) = serde_json::from_str::<MsgStartEvent>(event_str) {
                     self.input = evt.message.usage.input_tokens;
                     self.cache_read = evt.message.usage.cache_read_input_tokens;
@@ -289,6 +298,9 @@ impl StreamJsonParser {
                 }
             }
             "message_delta" => {
+                let Some(event_str) = extract_event_json(line) else {
+                    return;
+                };
                 if let Ok(evt) = serde_json::from_str::<MsgDeltaEvent>(event_str)
                     && let Some(usage) = evt.usage
                     && usage.output_tokens > 0
@@ -298,6 +310,9 @@ impl StreamJsonParser {
                 }
             }
             "error" => {
+                let Some(event_str) = extract_event_json(line) else {
+                    return;
+                };
                 if let Ok(evt) = serde_json::from_str::<ErrorEvt>(event_str) {
                     out.push(AgentEvent::Error {
                         error_type: evt.error.error_type.into_owned(),
@@ -437,6 +452,20 @@ impl StreamJsonParser {
             cost_usd: self.live_cost(),
         }));
     }
+}
+
+/// Extract the inner event type from a stream_event line without finding event boundaries.
+/// Looks for `"event":{"type":"` which is at a fixed position in the stream_event format.
+fn inner_event_type(line: &str) -> Option<&str> {
+    const NEEDLE: &[u8] = b"\"event\":{\"type\":\"";
+    let bytes = line.as_bytes();
+    let search_end = bytes.len().min(50);
+    let pos = bytes[..search_end]
+        .windows(NEEDLE.len())
+        .position(|w| w == NEEDLE)?;
+    let val_start = pos + NEEDLE.len();
+    let val_end = val_start + bytes[val_start..].iter().position(|&b| b == b'"')?;
+    Some(&line[val_start..val_end])
 }
 
 /// Extract the delta type and content string from a content_block_delta event JSON.
