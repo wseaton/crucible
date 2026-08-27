@@ -135,6 +135,13 @@ impl StreamJsonParser {
             line
         };
 
+        // Fast path: ~85% of lines are stream_event with "type":" at byte 1 and value at 9
+        let bytes = line.as_bytes();
+        if bytes.len() > 21 && &bytes[1..9] == b"\"type\":\"" && &bytes[9..21] == b"stream_event" {
+            self.stream_event_fast(line, out);
+            return;
+        }
+
         match quick_type(line) {
             Some("assistant") | Some("rate_limit_event") => {}
             Some("stream_event") => self.stream_event_fast(line, out),
