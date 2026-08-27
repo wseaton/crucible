@@ -117,10 +117,16 @@ impl StreamJsonParser {
     /// Like [`push`](Self::push) but appends events to a caller-owned buffer,
     /// avoiding a per-line allocation.
     pub fn push_into(&mut self, line: &str, out: &mut Vec<AgentEvent>) {
-        let line = line.trim();
-        if line.is_empty() {
-            return;
-        }
+        let bytes = line.as_bytes();
+        let line = if !bytes.is_empty() && !bytes[0].is_ascii_whitespace() {
+            line
+        } else {
+            let line = line.trim();
+            if line.is_empty() {
+                return;
+            }
+            line
+        };
 
         match quick_type(line) {
             Some("assistant") | Some("rate_limit_event") => {}
