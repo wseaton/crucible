@@ -446,12 +446,20 @@ fn extract_u64_field(line: &str, key: &[u8]) -> Option<u64> {
 fn extract_delta(event: &str) -> Option<(&str, Cow<'_, str>)> {
     let bytes = event.as_bytes();
     const DELTA_TYPE: &[u8] = b"\"delta\":{\"type\":\"";
-    let skip = 60.min(bytes.len());
-    let pos = skip
-        + bytes[skip..]
-            .windows(DELTA_TYPE.len())
-            .position(|w| w == DELTA_TYPE)?;
-    let type_start = pos + DELTA_TYPE.len();
+    let dt_len = DELTA_TYPE.len();
+    // Fast path: index 0-9 → needle at byte 71; index 10-99 → byte 72
+    let type_start = if bytes.len() > 71 + dt_len && &bytes[71..71 + dt_len] == DELTA_TYPE {
+        71 + dt_len
+    } else if bytes.len() > 72 + dt_len && &bytes[72..72 + dt_len] == DELTA_TYPE {
+        72 + dt_len
+    } else {
+        let skip = 60.min(bytes.len());
+        let pos = skip
+            + bytes[skip..]
+                .windows(dt_len)
+                .position(|w| w == DELTA_TYPE)?;
+        pos + dt_len
+    };
 
     let (delta_type, value_offset) = match bytes.get(type_start)? {
         b't' => {
