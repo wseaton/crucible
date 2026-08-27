@@ -9,7 +9,9 @@
 
 use crate::otel::{CostHandle, LiveMeters, RateHandle};
 use crucible_contract::event::{AgentEvent, RawStream, Tokens};
+use serde::Deserialize;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Emit a [`Tokens`] sample once the running total has grown by at least this much
@@ -35,6 +37,78 @@ impl TextKind {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Zero-copy deserialization helpers for the hot path
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CbStartEvent<'a> {
+    #[serde(borrow)]
+    content_block: CbInfo<'a>,
+}
+
+#[derive(Deserialize)]
+struct CbInfo<'a> {
+    #[serde(borrow, rename = "type")]
+    kind: &'a str,
+    #[serde(borrow, default)]
+    name: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    id: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+struct MsgStartEvent {
+    message: MsgUsageWrap,
+}
+
+#[derive(Deserialize)]
+struct MsgUsageWrap {
+    #[serde(default)]
+    usage: UsageFields,
+}
+
+#[derive(Deserialize, Default)]
+struct UsageFields {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[allow(dead_code)]
+    #[serde(default)]
+    output_tokens: u64,
+}
+
+#[derive(Deserialize)]
+struct MsgDeltaEvent {
+    #[serde(default)]
+    usage: Option<UsageDeltaFields>,
+}
+
+#[derive(Deserialize)]
+struct UsageDeltaFields {
+    #[serde(default)]
+    output_tokens: u64,
+}
+
+#[derive(Deserialize)]
+struct ErrorEvt<'a> {
+    #[serde(borrow)]
+    error: ErrInfo<'a>,
+}
+
+#[derive(Deserialize)]
+struct ErrInfo<'a> {
+    #[serde(borrow, rename = "type", default)]
+    error_type: Cow<'a, str>,
+    #[serde(borrow, default)]
+    message: Cow<'a, str>,
+}
+
+// ---------------------------------------------------------------------------
 
 /// Stateful decoder: feed it one stdout line at a time via [`StreamJsonParser::push`].
 #[derive(Default)]
@@ -94,45 +168,47 @@ impl StreamJsonParser {
         if line.is_empty() {
             return out;
         }
-        let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            out.push(raw(line));
-            return out;
-        };
 
-        match msg.get("type").and_then(Value::as_str) {
-            Some("system") => self.system(&msg, &mut out),
-            Some("result") => {
-                self.end_block(&mut out);
-                let is_error = bool_field(&msg, "is_error");
-                // Only capture the CLI's text on the error path (`result`, or `error` when the
-                // CLI splits them out); a clean turn's final message would fatten every line.
-                let error = is_error
-                    .then(|| {
-                        let r = str_field(&msg, "result");
-                        if r.is_empty() {
-                            str_field(&msg, "error")
-                        } else {
-                            r
-                        }
-                    })
-                    .filter(|s| !s.is_empty());
-                let cost_usd = f64_field(&msg, "total_cost_usd");
-                self.stream_cost = self.stream_cost.max(cost_usd);
-                out.push(AgentEvent::Result {
-                    subtype: str_field(&msg, "subtype"),
-                    is_error,
-                    turns: u64_field(&msg, "num_turns") as u32,
-                    cost_usd,
-                    error,
-                });
-            }
-            Some("stream_event") => self.stream_event(&msg, &mut out),
-            // `user` echoes carry the tool results; only read under verbose tool IO.
-            Some("user") => self.tool_results(&msg, &mut out),
-            // `assistant` echoes duplicate the text already streamed via `stream_event`, and
-            // `rate_limit_event` carries nothing the turn accounts for.
+        match quick_type(line) {
             Some("assistant") | Some("rate_limit_event") => {}
-            _ => out.push(raw(line)),
+            Some("stream_event") => self.stream_event_fast(line, &mut out),
+            Some("system") => {
+                if let Ok(msg) = serde_json::from_str::<Value>(line) {
+                    self.system(&msg, &mut out);
+                }
+            }
+            Some("result") => {
+                if let Ok(msg) = serde_json::from_str::<Value>(line) {
+                    self.end_block(&mut out);
+                    let is_error = bool_field(&msg, "is_error");
+                    let error = is_error
+                        .then(|| {
+                            let r = str_field(&msg, "result");
+                            if r.is_empty() {
+                                str_field(&msg, "error")
+                            } else {
+                                r
+                            }
+                        })
+                        .filter(|s| !s.is_empty());
+                    let cost_usd = f64_field(&msg, "total_cost_usd");
+                    self.stream_cost = self.stream_cost.max(cost_usd);
+                    out.push(AgentEvent::Result {
+                        subtype: str_field(&msg, "subtype"),
+                        is_error,
+                        turns: u64_field(&msg, "num_turns") as u32,
+                        cost_usd,
+                        error,
+                    });
+                }
+            }
+            Some("user") => {
+                if let Ok(msg) = serde_json::from_str::<Value>(line) {
+                    self.tool_results(&msg, &mut out);
+                }
+            }
+            Some(_) => out.push(raw(line)),
+            None => out.push(raw(line)),
         }
         out
     }
@@ -154,67 +230,80 @@ impl StreamJsonParser {
         }
     }
 
-    /// Dispatch a wrapped Anthropic streaming event (`msg.event.type`).
-    fn stream_event(&mut self, msg: &Value, out: &mut Vec<AgentEvent>) {
-        let Some(event) = msg.get("event") else {
+    /// Fast-path dispatch for stream_event lines. Extracts the event JSON boundaries
+    /// via byte scanning (avoiding a full parse of session_id/uuid/etc), then dispatches
+    /// on the inner event type with zero-copy typed deserialization.
+    fn stream_event_fast(&mut self, line: &str, out: &mut Vec<AgentEvent>) {
+        let Some(event_str) = extract_event_json(line) else {
             return;
         };
-        match event.get("type").and_then(Value::as_str) {
-            Some("content_block_start") => {
-                let block = event.get("content_block").unwrap_or(&Value::Null);
-                match block.get("type").and_then(Value::as_str) {
-                    Some("text") => self.block = Some(TextKind::Text),
-                    Some("thinking") => self.block = Some(TextKind::Thinking),
-                    Some("tool_use" | "server_tool_use") => {
-                        self.tool_name = Some(str_field(block, "name"));
+
+        let Some(event_type) = quick_type(event_str) else {
+            return;
+        };
+
+        match event_type {
+            "content_block_delta" => {
+                if let Some((delta_type, content)) = extract_delta(event_str) {
+                    match delta_type {
+                        "text_delta" => self.buffer(TextKind::Text, &content, out),
+                        "thinking_delta" => self.buffer(TextKind::Thinking, &content, out),
+                        "input_json_delta" => self.tool_json.push_str(&content),
+                        _ => {}
+                    }
+                }
+            }
+            "content_block_start" => {
+                let Ok(evt) = serde_json::from_str::<CbStartEvent>(event_str) else {
+                    return;
+                };
+                match evt.content_block.kind {
+                    "text" => self.block = Some(TextKind::Text),
+                    "thinking" => self.block = Some(TextKind::Thinking),
+                    "tool_use" | "server_tool_use" => {
+                        let name = evt
+                            .content_block
+                            .name
+                            .map(Cow::into_owned)
+                            .unwrap_or_default();
+                        self.tool_name = Some(name);
                         self.tool_json.clear();
                         if self.tool_io {
-                            let id = str_field(block, "id");
+                            let id = evt
+                                .content_block
+                                .id
+                                .map(Cow::into_owned)
+                                .unwrap_or_default();
                             self.tool_id = (!id.is_empty()).then_some(id);
                         }
                     }
                     _ => {}
                 }
             }
-            Some("content_block_delta") => {
-                let delta = event.get("delta").unwrap_or(&Value::Null);
-                match delta.get("type").and_then(Value::as_str) {
-                    Some("text_delta") => {
-                        self.buffer(TextKind::Text, &str_field(delta, "text"), out)
-                    }
-                    Some("thinking_delta") => {
-                        self.buffer(TextKind::Thinking, &str_field(delta, "thinking"), out)
-                    }
-                    Some("input_json_delta") => {
-                        self.tool_json.push_str(&str_field(delta, "partial_json"))
-                    }
-                    _ => {}
+            "content_block_stop" => self.end_block(out),
+            "message_start" => {
+                if let Ok(evt) = serde_json::from_str::<MsgStartEvent>(event_str) {
+                    self.input = evt.message.usage.input_tokens;
+                    self.cache_read = evt.message.usage.cache_read_input_tokens;
+                    self.cache_write = evt.message.usage.cache_creation_input_tokens;
                 }
             }
-            Some("content_block_stop") => self.end_block(out),
-            Some("message_start") => {
-                let usage = event
-                    .get("message")
-                    .and_then(|m| m.get("usage"))
-                    .unwrap_or(&Value::Null);
-                self.input = u64_field(usage, "input_tokens");
-                self.cache_read = u64_field(usage, "cache_read_input_tokens");
-                self.cache_write = u64_field(usage, "cache_creation_input_tokens");
-            }
-            Some("message_delta") => {
-                let usage = event.get("usage").unwrap_or(&Value::Null);
-                let out_tokens = u64_field(usage, "output_tokens");
-                if out_tokens > 0 {
-                    self.output = out_tokens;
+            "message_delta" => {
+                if let Ok(evt) = serde_json::from_str::<MsgDeltaEvent>(event_str)
+                    && let Some(usage) = evt.usage
+                    && usage.output_tokens > 0
+                {
+                    self.output = usage.output_tokens;
                     self.maybe_emit_tokens(out);
                 }
             }
-            Some("error") => {
-                let err = event.get("error").unwrap_or(&Value::Null);
-                out.push(AgentEvent::Error {
-                    error_type: str_field(err, "type"),
-                    message: str_field(err, "message"),
-                });
+            "error" => {
+                if let Ok(evt) = serde_json::from_str::<ErrorEvt>(event_str) {
+                    out.push(AgentEvent::Error {
+                        error_type: evt.error.error_type.into_owned(),
+                        message: evt.error.message.into_owned(),
+                    });
+                }
             }
             _ => {}
         }
@@ -234,10 +323,14 @@ impl StreamJsonParser {
     fn buffer(&mut self, kind: TextKind, chunk: &str, out: &mut Vec<AgentEvent>) {
         self.block = Some(kind);
         self.buf.push_str(chunk);
-        while let Some(i) = self.buf.find('\n') {
-            let mut line: String = self.buf.drain(..=i).collect();
-            line.pop(); // drop the trailing '\n'
-            out.push(kind.event(line));
+        let mut start = 0;
+        while let Some(pos) = self.buf[start..].find('\n') {
+            let end = start + pos;
+            out.push(kind.event(self.buf[start..end].to_string()));
+            start = end + 1;
+        }
+        if start > 0 {
+            self.buf.drain(..start);
         }
     }
 
@@ -344,6 +437,101 @@ impl StreamJsonParser {
             cost_usd: self.live_cost(),
         }));
     }
+}
+
+/// Extract the delta type and content string from a content_block_delta event JSON.
+/// Scans for the delta type via bytes, then decodes just the content JSON string,
+/// avoiding a full struct parse on the hottest path.
+fn extract_delta(event: &str) -> Option<(&str, Cow<'_, str>)> {
+    let bytes = event.as_bytes();
+    const DELTA_TYPE: &[u8] = b"\"delta\":{\"type\":\"";
+    let pos = bytes
+        .windows(DELTA_TYPE.len())
+        .position(|w| w == DELTA_TYPE)?;
+    let type_start = pos + DELTA_TYPE.len();
+    let type_end = type_start + bytes[type_start..].iter().position(|&b| b == b'"')?;
+    let delta_type = &event[type_start..type_end];
+
+    let content_key: &[u8] = match delta_type {
+        "text_delta" => b"\"text\":",
+        "thinking_delta" => b"\"thinking\":",
+        "input_json_delta" => b"\"partial_json\":",
+        _ => return None,
+    };
+
+    let search_start = type_end + 1;
+    let key_pos = bytes[search_start..]
+        .windows(content_key.len())
+        .position(|w| w == content_key)?;
+    let value_start = search_start + key_pos + content_key.len();
+
+    let mut de = serde_json::Deserializer::from_str(&event[value_start..]);
+    let value: Cow<'_, str> = serde::Deserialize::deserialize(&mut de).ok()?;
+
+    Some((delta_type, value))
+}
+
+/// Extract the JSON object value of the `"event"` key from a stream_event line.
+/// Finds `"event":` then tracks brace nesting (respecting JSON strings) to locate
+/// the matching `}`. Returns the substring `{...}` without parsing anything.
+fn extract_event_json(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    const NEEDLE: &[u8] = b"\"event\":";
+    let search_end = bytes.len().min(40);
+    let pos = bytes[..search_end]
+        .windows(NEEDLE.len())
+        .position(|w| w == NEEDLE)?;
+    let mut i = pos + NEEDLE.len();
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'{' {
+        return None;
+    }
+    let obj_start = i;
+    let mut depth = 0u32;
+    let mut in_string = false;
+    let mut escape = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escape {
+            escape = false;
+        } else if in_string {
+            if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&line[obj_start..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Extract the value of the first `"type":"..."` field via byte scanning.
+/// Type values are plain ASCII identifiers, never containing escape sequences.
+fn quick_type(line: &str) -> Option<&str> {
+    const NEEDLE: &[u8] = b"\"type\":\"";
+    let bytes = line.as_bytes();
+    let search_end = bytes.len().min(80);
+    let pos = bytes[..search_end]
+        .windows(NEEDLE.len())
+        .position(|w| w == NEEDLE)?;
+    let val_start = pos + NEEDLE.len();
+    let val_end = val_start + bytes[val_start..].iter().position(|&b| b == b'"')?;
+    Some(&line[val_start..val_end])
 }
 
 /// A compact one-line summary for known tools; unknown tools fall back to a truncated
