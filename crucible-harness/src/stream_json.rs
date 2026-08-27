@@ -295,19 +295,21 @@ impl StreamJsonParser {
     /// Close the open block: emit a completed tool call, or flush a text/thinking tail.
     fn end_block(&mut self, out: &mut Vec<AgentEvent>) {
         if let Some(name) = self.tool_name.take() {
-            let parsed = serde_json::from_str::<Value>(&self.tool_json).ok();
-            let summary = parsed
-                .as_ref()
-                .map(|p| format_tool(&name, p))
-                .unwrap_or_default();
             let subagent = name == "Agent" || name == "Task";
-            let input = if self.tool_io {
+            let (summary, input) = if self.tool_io {
+                let parsed = serde_json::from_str::<Value>(&self.tool_json).ok();
+                let summary = parsed
+                    .as_ref()
+                    .map(|p| format_tool(&name, p))
+                    .unwrap_or_default();
                 if let Some(id) = self.tool_id.take() {
                     self.tool_names.push((id, name.clone()));
                 }
-                parsed.as_ref().map(bounded_input)
+                let input = parsed.as_ref().map(bounded_input);
+                (summary, input)
             } else {
-                None
+                let summary = format_tool_fast(&name, &self.tool_json);
+                (summary, None)
             };
             out.push(AgentEvent::Tool {
                 name,
@@ -569,6 +571,159 @@ fn quick_type(line: &str) -> Option<&str> {
     let val_start = pos + NEEDLE.len();
     let val_end = val_start + bytes[val_start..].iter().position(|&b| b == b'"')?;
     Some(&line[val_start..val_end])
+}
+
+/// Extract a JSON string value for a given key via byte scanning.
+/// Returns borrowed &str when no escape sequences are present; falls back to
+/// serde for escaped strings.
+fn scan_json_str<'a>(json: &'a str, key: &[u8]) -> Cow<'a, str> {
+    let bytes = json.as_bytes();
+    let Some(pos) = bytes.windows(key.len()).position(|w| w == key) else {
+        return Cow::Borrowed("");
+    };
+    let val_start = pos + key.len();
+    if val_start >= bytes.len() || bytes[val_start] != b'"' {
+        return Cow::Borrowed("");
+    }
+    let str_start = val_start + 1;
+    let mut i = str_start;
+    let mut has_escape = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if !has_escape {
+                    return Cow::Borrowed(&json[str_start..i]);
+                }
+                let mut de = serde_json::Deserializer::from_str(&json[val_start..]);
+                if let Ok(value) = serde::Deserialize::deserialize(&mut de) {
+                    return value;
+                }
+                return Cow::Borrowed("");
+            }
+            b'\\' => {
+                has_escape = true;
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Cow::Borrowed("")
+}
+
+/// Extract a JSON number value for a given key via byte scanning.
+fn scan_json_num(json: &str, key: &[u8]) -> Option<u64> {
+    let bytes = json.as_bytes();
+    let pos = bytes.windows(key.len()).position(|w| w == key)?;
+    let val_start = pos + key.len();
+    let mut val: u64 = 0;
+    let mut i = val_start;
+    let mut found = false;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        val = val * 10 + (bytes[i] - b'0') as u64;
+        found = true;
+        i += 1;
+    }
+    found.then_some(val)
+}
+
+/// Byte-scanning fast path for format_tool: extracts fields without parsing JSON.
+fn format_tool_fast(name: &str, json: &str) -> String {
+    match name {
+        "Bash" => {
+            let cmd = scan_json_str(json, b"\"command\":");
+            let desc = scan_json_str(json, b"\"description\":");
+            if desc.is_empty() {
+                format!("$ {cmd}")
+            } else {
+                format!("$ {cmd}  # {desc}")
+            }
+        }
+        "Read" => {
+            let path = scan_json_str(json, b"\"file_path\":");
+            let path = if path.is_empty() {
+                scan_json_str(json, b"\"filePath\":")
+            } else {
+                path
+            };
+            let mut s = path.into_owned();
+            if let Some(o) = scan_json_num(json, b"\"offset\":") {
+                s.push_str(&format!(" L{o}"));
+            }
+            if let Some(l) = scan_json_num(json, b"\"limit\":") {
+                s.push_str(&format!(" +{l}"));
+            }
+            s
+        }
+        "Write" => {
+            let path = scan_json_str(json, b"\"file_path\":");
+            if path.is_empty() {
+                scan_json_str(json, b"\"filePath\":").into_owned()
+            } else {
+                path.into_owned()
+            }
+        }
+        "Edit" => {
+            let path = scan_json_str(json, b"\"file_path\":");
+            let path = if path.is_empty() {
+                scan_json_str(json, b"\"filePath\":")
+            } else {
+                path
+            };
+            let old = scan_json_str(json, b"\"old_string\":");
+            let old = if old.is_empty() {
+                scan_json_str(json, b"\"oldString\":")
+            } else {
+                old
+            };
+            let first = old.lines().next().unwrap_or("");
+            let preview: String = first.chars().take(60).collect();
+            let ell = if first.chars().count() > 60 {
+                "\u{2026}"
+            } else {
+                ""
+            };
+            format!("{path}: {preview}{ell}")
+        }
+        "Agent" | "Task" => {
+            let desc = scan_json_str(json, b"\"description\":");
+            let at = scan_json_str(json, b"\"subagent_type\":");
+            let at = if at.is_empty() {
+                scan_json_str(json, b"\"subagentType\":")
+            } else {
+                at
+            };
+            if at.is_empty() {
+                desc.into_owned()
+            } else {
+                format!("[{at}] {desc}")
+            }
+        }
+        "Glob" => {
+            let pat = scan_json_str(json, b"\"pattern\":");
+            let path = scan_json_str(json, b"\"path\":");
+            let path = if path.is_empty() { Cow::Borrowed(".") } else { path };
+            format!("{pat} in {path}")
+        }
+        "Grep" => {
+            let pat = scan_json_str(json, b"\"pattern\":");
+            let path = scan_json_str(json, b"\"path\":");
+            let path = if path.is_empty() { Cow::Borrowed(".") } else { path };
+            format!("/{pat}/ in {path}")
+        }
+        "Skill" => {
+            let skill = scan_json_str(json, b"\"skill\":");
+            let args = scan_json_str(json, b"\"args\":");
+            format!("/{skill} {args}").trim().to_string()
+        }
+        _ => {
+            if let Ok(p) = serde_json::from_str::<Value>(json) {
+                format_tool(name, &p)
+            } else {
+                String::new()
+            }
+        }
+    }
 }
 
 /// A compact one-line summary for known tools; unknown tools fall back to a truncated
