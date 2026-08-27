@@ -12,8 +12,6 @@ use crucible_contract::event::{AgentEvent, RawStream, Tokens};
 use serde::Deserialize;
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::HashMap;
-
 /// Emit a [`Tokens`] sample once the running total has grown by at least this much
 /// (or on the first sample).
 const TOKEN_EMIT_STEP: u64 = 5_000;
@@ -90,7 +88,7 @@ pub struct StreamJsonParser {
     // The open `tool_use` block's id, and id -> name for labeling result excerpts.
     // Only populated under verbose tool IO.
     tool_id: Option<String>,
-    tool_names: HashMap<String, String>,
+    tool_names: Vec<(String, String)>,
 }
 
 impl StreamJsonParser {
@@ -299,7 +297,7 @@ impl StreamJsonParser {
             let subagent = name == "Agent" || name == "Task";
             let input = if self.tool_io {
                 if let Some(id) = self.tool_id.take() {
-                    self.tool_names.insert(id, name.clone());
+                    self.tool_names.push((id, name.clone()));
                 }
                 parsed.as_ref().map(bounded_input)
             } else {
@@ -343,7 +341,9 @@ impl StreamJsonParser {
             let id = str_field(block, "tool_use_id");
             let name = self
                 .tool_names
-                .remove(&id)
+                .iter()
+                .position(|(k, _)| k == &id)
+                .map(|i| self.tool_names.swap_remove(i).1)
                 .unwrap_or_else(|| "tool".to_string());
             out.push(AgentEvent::Tool {
                 name,

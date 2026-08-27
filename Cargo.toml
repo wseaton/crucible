@@ -35,4 +35,6 @@ tonic = { version = "0.14", features = ["channel", "tls-native-roots", "tls-ring
 thiserror = "2"
 
 [profile.release]
-opt-level = 2
+opt-level = 3
+lto = "fat"
+codegen-units = 1
