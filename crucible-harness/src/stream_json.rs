@@ -20,6 +20,13 @@ const TOKEN_EMIT_STEP: u64 = 5_000;
 /// Read cannot balloon the session log.
 pub(crate) const TOOL_IO_LIMIT: usize = 2_048;
 
+#[derive(Clone, Copy)]
+enum DeltaKind {
+    Text,
+    Thinking,
+    InputJson,
+}
+
 /// Which streamed text block is currently open (its deltas buffer to line boundaries).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TextKind {
@@ -201,17 +208,16 @@ impl StreamJsonParser {
 
         match inner_type {
             "content_block_delta" => {
-                if let Some((delta_type, content)) = extract_delta(line) {
-                    match delta_type {
-                        "text_delta" => self.buffer(TextKind::Text, &content, out),
-                        "thinking_delta" => self.buffer(TextKind::Thinking, &content, out),
-                        "input_json_delta" => self.tool_json.push_str(&content),
-                        _ => {}
+                if let Some((delta_kind, content)) = extract_delta(line) {
+                    match delta_kind {
+                        DeltaKind::Text => self.buffer(TextKind::Text, &content, out),
+                        DeltaKind::Thinking => self.buffer(TextKind::Thinking, &content, out),
+                        DeltaKind::InputJson => self.tool_json.push_str(&content),
                     }
                 }
             }
             "content_block_start" => {
-                match extract_str_after(line, b"\"content_block\":{\"type\":\"") {
+                match extract_str_at_offsets(line, b"\"content_block\":{\"type\":\"", 71, 72) {
                     Some("text") => self.block = Some(TextKind::Text),
                     Some("thinking") => self.block = Some(TextKind::Thinking),
                     Some("tool_use") | Some("server_tool_use") => {
@@ -451,7 +457,7 @@ fn extract_u64_field(line: &str, key: &[u8]) -> Option<u64> {
 /// Extract the delta type and content string from a content_block_delta event JSON.
 /// Scans for the delta type via bytes, then jumps directly to the content value
 /// using known field layout, avoiding a second scan on the hottest path.
-fn extract_delta(event: &str) -> Option<(&str, Cow<'_, str>)> {
+fn extract_delta(event: &str) -> Option<(DeltaKind, Cow<'_, str>)> {
     let bytes = event.as_bytes();
     const DELTA_TYPE: &[u8] = b"\"delta\":{\"type\":\"";
     let dt_len = DELTA_TYPE.len();
@@ -469,15 +475,15 @@ fn extract_delta(event: &str) -> Option<(&str, Cow<'_, str>)> {
         pos + dt_len
     };
 
-    let (delta_type, value_offset) = match bytes.get(type_start)? {
+    let (delta_kind, value_offset) = match bytes.get(type_start)? {
         b't' => {
             if bytes.get(type_start + 1) == Some(&b'e') {
-                ("text_delta", 20) // text_delta","text":"
+                (DeltaKind::Text, 20) // text_delta","text":"
             } else {
-                ("thinking_delta", 28) // thinking_delta","thinking":"
+                (DeltaKind::Thinking, 28) // thinking_delta","thinking":"
             }
         }
-        b'i' => ("input_json_delta", 34), // input_json_delta","partial_json":"
+        b'i' => (DeltaKind::InputJson, 34), // input_json_delta","partial_json":"
         _ => return None,
     };
 
@@ -492,12 +498,12 @@ fn extract_delta(event: &str) -> Option<(&str, Cow<'_, str>)> {
         match bytes[i] {
             b'"' => {
                 if !has_escape {
-                    return Some((delta_type, Cow::Borrowed(&event[str_start..i])));
+                    return Some((delta_kind, Cow::Borrowed(&event[str_start..i])));
                 }
                 let value_start = str_start - 1;
                 let mut de = serde_json::Deserializer::from_str(&event[value_start..]);
                 let value: Cow<'_, str> = serde::Deserialize::deserialize(&mut de).ok()?;
-                return Some((delta_type, value));
+                return Some((delta_kind, value));
             }
             b'\\' => {
                 has_escape = true;
@@ -557,6 +563,22 @@ fn extract_event_json(line: &str) -> Option<&str> {
         i += 1;
     }
     None
+}
+
+/// Like extract_str_after but checks two hardcoded offsets first, then falls back to scan.
+fn extract_str_at_offsets<'a>(line: &'a str, needle: &[u8], off1: usize, off2: usize) -> Option<&'a str> {
+    let bytes = line.as_bytes();
+    let nlen = needle.len();
+    let val_start =
+        if bytes.len() > off1 + nlen && &bytes[off1..off1 + nlen] == needle {
+            off1 + nlen
+        } else if bytes.len() > off2 + nlen && &bytes[off2..off2 + nlen] == needle {
+            off2 + nlen
+        } else {
+            return extract_str_after(line, needle);
+        };
+    let val_end = val_start + bytes[val_start..].iter().position(|&b| b == b'"')?;
+    Some(&line[val_start..val_end])
 }
 
 /// Extract the value of the first `"type":"..."` field via byte scanning.
