@@ -441,38 +441,35 @@ fn extract_u64_field(line: &str, key: &[u8]) -> Option<u64> {
 }
 
 /// Extract the delta type and content string from a content_block_delta event JSON.
-/// Scans for the delta type via bytes, then decodes just the content JSON string,
-/// avoiding a full struct parse on the hottest path.
+/// Scans for the delta type via bytes, then jumps directly to the content value
+/// using known field layout, avoiding a second scan on the hottest path.
 fn extract_delta(event: &str) -> Option<(&str, Cow<'_, str>)> {
     let bytes = event.as_bytes();
     const DELTA_TYPE: &[u8] = b"\"delta\":{\"type\":\"";
-    // Start past "content_block_delta" (~byte 60) to skip known prefix
     let skip = 60.min(bytes.len());
     let pos = skip
         + bytes[skip..]
             .windows(DELTA_TYPE.len())
             .position(|w| w == DELTA_TYPE)?;
     let type_start = pos + DELTA_TYPE.len();
-    let type_end = type_start + bytes[type_start..].iter().position(|&b| b == b'"')?;
-    let delta_type = &event[type_start..type_end];
 
-    let content_key: &[u8] = match delta_type {
-        "text_delta" => b"\"text\":",
-        "thinking_delta" => b"\"thinking\":",
-        "input_json_delta" => b"\"partial_json\":",
+    let (delta_type, value_offset) = match bytes.get(type_start)? {
+        b't' => {
+            if bytes.get(type_start + 1) == Some(&b'e') {
+                ("text_delta", 20) // text_delta","text":"
+            } else {
+                ("thinking_delta", 28) // thinking_delta","thinking":"
+            }
+        }
+        b'i' => ("input_json_delta", 34), // input_json_delta","partial_json":"
         _ => return None,
     };
 
-    let search_start = type_end + 1;
-    let key_pos = bytes[search_start..]
-        .windows(content_key.len())
-        .position(|w| w == content_key)?;
-    let value_start = search_start + key_pos + content_key.len();
-
-    if value_start >= bytes.len() || bytes[value_start] != b'"' {
+    let str_start = type_start + value_offset;
+    if str_start >= bytes.len() {
         return None;
     }
-    let str_start = value_start + 1;
+
     let mut i = str_start;
     let mut has_escape = false;
     while i < bytes.len() {
@@ -481,6 +478,7 @@ fn extract_delta(event: &str) -> Option<(&str, Cow<'_, str>)> {
                 if !has_escape {
                     return Some((delta_type, Cow::Borrowed(&event[str_start..i])));
                 }
+                let value_start = str_start - 1;
                 let mut de = serde_json::Deserializer::from_str(&event[value_start..]);
                 let value: Cow<'_, str> = serde::Deserialize::deserialize(&mut de).ok()?;
                 return Some((delta_type, value));
