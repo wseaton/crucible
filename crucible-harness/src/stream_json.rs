@@ -43,22 +43,6 @@ impl TextKind {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct CbStartEvent<'a> {
-    #[serde(borrow)]
-    content_block: CbInfo<'a>,
-}
-
-#[derive(Deserialize)]
-struct CbInfo<'a> {
-    #[serde(borrow, rename = "type")]
-    kind: &'a str,
-    #[serde(borrow, default)]
-    name: Option<Cow<'a, str>>,
-    #[serde(borrow, default)]
-    id: Option<Cow<'a, str>>,
-}
-
-#[derive(Deserialize)]
 struct ErrorEvt<'a> {
     #[serde(borrow)]
     error: ErrInfo<'a>,
@@ -223,30 +207,20 @@ impl StreamJsonParser {
                 }
             }
             "content_block_start" => {
-                let Some(event_str) = extract_event_json(line) else {
-                    return;
-                };
-                let Ok(evt) = serde_json::from_str::<CbStartEvent>(event_str) else {
-                    return;
-                };
-                match evt.content_block.kind {
-                    "text" => self.block = Some(TextKind::Text),
-                    "thinking" => self.block = Some(TextKind::Thinking),
-                    "tool_use" | "server_tool_use" => {
-                        let name = evt
-                            .content_block
-                            .name
-                            .map(Cow::into_owned)
-                            .unwrap_or_default();
-                        self.tool_name = Some(name);
+                match extract_str_after(line, b"\"content_block\":{\"type\":\"") {
+                    Some("text") => self.block = Some(TextKind::Text),
+                    Some("thinking") => self.block = Some(TextKind::Thinking),
+                    Some("tool_use") | Some("server_tool_use") => {
+                        self.tool_name = Some(
+                            extract_str_after(line, b"\"name\":\"")
+                                .unwrap_or("")
+                                .to_string(),
+                        );
                         self.tool_json.clear();
                         if self.tool_io {
-                            let id = evt
-                                .content_block
-                                .id
-                                .map(Cow::into_owned)
-                                .unwrap_or_default();
-                            self.tool_id = (!id.is_empty()).then_some(id);
+                            self.tool_id = extract_str_after(line, b"\"id\":\"")
+                                .filter(|s| !s.is_empty())
+                                .map(String::from);
                         }
                     }
                     _ => {}
@@ -417,6 +391,15 @@ impl StreamJsonParser {
             cost_usd: self.live_cost(),
         }));
     }
+}
+
+/// Extract a simple unescaped string value following a byte pattern.
+fn extract_str_after<'a>(line: &'a str, key: &[u8]) -> Option<&'a str> {
+    let bytes = line.as_bytes();
+    let pos = bytes.windows(key.len()).position(|w| w == key)?;
+    let val_start = pos + key.len();
+    let val_end = val_start + bytes[val_start..].iter().position(|&b| b == b'"')?;
+    Some(&line[val_start..val_end])
 }
 
 /// Extract the inner event type from a stream_event line without finding event boundaries.
