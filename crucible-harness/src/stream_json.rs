@@ -481,9 +481,12 @@ fn inner_event_type(line: &str) -> Option<&str> {
 fn extract_delta(event: &str) -> Option<(&str, Cow<'_, str>)> {
     let bytes = event.as_bytes();
     const DELTA_TYPE: &[u8] = b"\"delta\":{\"type\":\"";
-    let pos = bytes
-        .windows(DELTA_TYPE.len())
-        .position(|w| w == DELTA_TYPE)?;
+    // Start past "content_block_delta" (~byte 60) to skip known prefix
+    let skip = 60.min(bytes.len());
+    let pos = skip
+        + bytes[skip..]
+            .windows(DELTA_TYPE.len())
+            .position(|w| w == DELTA_TYPE)?;
     let type_start = pos + DELTA_TYPE.len();
     let type_end = type_start + bytes[type_start..].iter().position(|&b| b == b'"')?;
     let delta_type = &event[type_start..type_end];
