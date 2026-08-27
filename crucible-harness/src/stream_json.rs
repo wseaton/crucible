@@ -494,10 +494,31 @@ fn extract_delta(event: &str) -> Option<(&str, Cow<'_, str>)> {
         .position(|w| w == content_key)?;
     let value_start = search_start + key_pos + content_key.len();
 
-    let mut de = serde_json::Deserializer::from_str(&event[value_start..]);
-    let value: Cow<'_, str> = serde::Deserialize::deserialize(&mut de).ok()?;
-
-    Some((delta_type, value))
+    if value_start >= bytes.len() || bytes[value_start] != b'"' {
+        return None;
+    }
+    let str_start = value_start + 1;
+    let mut i = str_start;
+    let mut has_escape = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if !has_escape {
+                    return Some((delta_type, Cow::Borrowed(&event[str_start..i])));
+                }
+                let mut de = serde_json::Deserializer::from_str(&event[value_start..]);
+                let value: Cow<'_, str> = serde::Deserialize::deserialize(&mut de).ok()?;
+                return Some((delta_type, value));
+            }
+            b'\\' => {
+                has_escape = true;
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Extract the JSON object value of the `"event"` key from a stream_event line.
