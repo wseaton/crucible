@@ -255,8 +255,10 @@ fn parse(lines: &[String], tool_io: bool) -> (usize, u64) {
     let mut p = StreamJsonParser::default().with_tool_io(tool_io);
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     let mut n = 0;
+    let mut buf = Vec::new();
     for line in lines {
-        for ev in p.push(line) {
+        p.push_into(line, &mut buf);
+        for ev in buf.drain(..) {
             n += 1;
             fnv1a(
                 &mut hash,

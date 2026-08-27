@@ -9,9 +9,9 @@
 
 use crate::otel::{CostHandle, LiveMeters, RateHandle};
 use crucible_contract::event::{AgentEvent, RawStream, Tokens};
+use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
-
+use std::borrow::Cow;
 /// Emit a [`Tokens`] sample once the running total has grown by at least this much
 /// (or on the first sample).
 const TOKEN_EMIT_STEP: u64 = 5_000;
@@ -19,6 +19,13 @@ const TOKEN_EMIT_STEP: u64 = 5_000;
 /// Byte bound on each verbose tool input / result excerpt, so one giant Write or
 /// Read cannot balloon the session log.
 pub(crate) const TOOL_IO_LIMIT: usize = 2_048;
+
+#[derive(Clone, Copy)]
+enum DeltaKind {
+    Text,
+    Thinking,
+    InputJson,
+}
 
 /// Which streamed text block is currently open (its deltas buffer to line boundaries).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -35,6 +42,26 @@ impl TextKind {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Zero-copy deserialization helpers for the hot path
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ErrorEvt<'a> {
+    #[serde(borrow)]
+    error: ErrInfo<'a>,
+}
+
+#[derive(Deserialize)]
+struct ErrInfo<'a> {
+    #[serde(borrow, rename = "type", default)]
+    error_type: Cow<'a, str>,
+    #[serde(borrow, default)]
+    message: Cow<'a, str>,
+}
+
+// ---------------------------------------------------------------------------
 
 /// Stateful decoder: feed it one stdout line at a time via [`StreamJsonParser::push`].
 #[derive(Default)]
@@ -68,7 +95,7 @@ pub struct StreamJsonParser {
     // The open `tool_use` block's id, and id -> name for labeling result excerpts.
     // Only populated under verbose tool IO.
     tool_id: Option<String>,
-    tool_names: HashMap<String, String>,
+    tool_names: Vec<(String, String)>,
 }
 
 impl StreamJsonParser {
@@ -90,51 +117,74 @@ impl StreamJsonParser {
     /// Decode one line of claude `stream-json`, returning every [`AgentEvent`] it completed.
     pub fn push(&mut self, line: &str) -> Vec<AgentEvent> {
         let mut out = Vec::new();
-        let line = line.trim();
-        if line.is_empty() {
-            return out;
-        }
-        let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            out.push(raw(line));
-            return out;
+        self.push_into(line, &mut out);
+        out
+    }
+
+    /// Like [`push`](Self::push) but appends events to a caller-owned buffer,
+    /// avoiding a per-line allocation.
+    pub fn push_into(&mut self, line: &str, out: &mut Vec<AgentEvent>) {
+        let bytes = line.as_bytes();
+        let line = if !bytes.is_empty() && !bytes[0].is_ascii_whitespace() {
+            line
+        } else {
+            let line = line.trim();
+            if line.is_empty() {
+                return;
+            }
+            line
         };
 
-        match msg.get("type").and_then(Value::as_str) {
-            Some("system") => self.system(&msg, &mut out),
-            Some("result") => {
-                self.end_block(&mut out);
-                let is_error = bool_field(&msg, "is_error");
-                // Only capture the CLI's text on the error path (`result`, or `error` when the
-                // CLI splits them out); a clean turn's final message would fatten every line.
-                let error = is_error
-                    .then(|| {
-                        let r = str_field(&msg, "result");
-                        if r.is_empty() {
-                            str_field(&msg, "error")
-                        } else {
-                            r
-                        }
-                    })
-                    .filter(|s| !s.is_empty());
-                let cost_usd = f64_field(&msg, "total_cost_usd");
-                self.stream_cost = self.stream_cost.max(cost_usd);
-                out.push(AgentEvent::Result {
-                    subtype: str_field(&msg, "subtype"),
-                    is_error,
-                    turns: u64_field(&msg, "num_turns") as u32,
-                    cost_usd,
-                    error,
-                });
-            }
-            Some("stream_event") => self.stream_event(&msg, &mut out),
-            // `user` echoes carry the tool results; only read under verbose tool IO.
-            Some("user") => self.tool_results(&msg, &mut out),
-            // `assistant` echoes duplicate the text already streamed via `stream_event`, and
-            // `rate_limit_event` carries nothing the turn accounts for.
-            Some("assistant") | Some("rate_limit_event") => {}
-            _ => out.push(raw(line)),
+        // Fast path: ~85% of lines are stream_event with "type":" at byte 1 and value at 9
+        let bytes = line.as_bytes();
+        if bytes.len() > 21 && &bytes[1..9] == b"\"type\":\"" && &bytes[9..21] == b"stream_event" {
+            self.stream_event_fast(line, out);
+            return;
         }
-        out
+
+        match quick_type(line) {
+            Some("assistant") | Some("rate_limit_event") => {}
+            Some("stream_event") => self.stream_event_fast(line, out),
+            Some("system") => {
+                if let Ok(msg) = serde_json::from_str::<Value>(line) {
+                    self.system(&msg, out);
+                }
+            }
+            Some("result") => {
+                if let Ok(msg) = serde_json::from_str::<Value>(line) {
+                    self.end_block(out);
+                    let is_error = bool_field(&msg, "is_error");
+                    let error = is_error
+                        .then(|| {
+                            let r = str_field(&msg, "result");
+                            if r.is_empty() {
+                                str_field(&msg, "error")
+                            } else {
+                                r
+                            }
+                        })
+                        .filter(|s| !s.is_empty());
+                    let cost_usd = f64_field(&msg, "total_cost_usd");
+                    self.stream_cost = self.stream_cost.max(cost_usd);
+                    out.push(AgentEvent::Result {
+                        subtype: str_field(&msg, "subtype"),
+                        is_error,
+                        turns: u64_field(&msg, "num_turns") as u32,
+                        cost_usd,
+                        error,
+                    });
+                }
+            }
+            Some("user") => {
+                if self.tool_io
+                    && let Ok(msg) = serde_json::from_str::<Value>(line)
+                {
+                    self.tool_results(&msg, out);
+                }
+            }
+            Some(_) => out.push(raw(line)),
+            None => out.push(raw(line)),
+        }
     }
 
     /// `system/init` -> [`AgentEvent::Init`]; `system/api_retry` -> [`AgentEvent::Retry`].
@@ -154,67 +204,77 @@ impl StreamJsonParser {
         }
     }
 
-    /// Dispatch a wrapped Anthropic streaming event (`msg.event.type`).
-    fn stream_event(&mut self, msg: &Value, out: &mut Vec<AgentEvent>) {
-        let Some(event) = msg.get("event") else {
+    /// Fast-path dispatch for stream_event lines. For the hottest path
+    /// (content_block_delta), extracts the delta directly from the line without
+    /// isolating the event JSON first. For other event types, falls back to
+    /// brace-tracking extraction + typed deserialization.
+    fn stream_event_fast(&mut self, line: &str, out: &mut Vec<AgentEvent>) {
+        let Some(inner_type) = inner_event_type(line) else {
             return;
         };
-        match event.get("type").and_then(Value::as_str) {
-            Some("content_block_start") => {
-                let block = event.get("content_block").unwrap_or(&Value::Null);
-                match block.get("type").and_then(Value::as_str) {
+
+        match inner_type {
+            "content_block_delta" => {
+                if let Some((delta_kind, content)) = extract_delta(line) {
+                    match delta_kind {
+                        DeltaKind::Text => self.buffer(TextKind::Text, &content, out),
+                        DeltaKind::Thinking => self.buffer(TextKind::Thinking, &content, out),
+                        DeltaKind::InputJson => self.tool_json.push_str(&content),
+                    }
+                }
+            }
+            "content_block_start" => {
+                match extract_str_at_offsets(line, b"\"content_block\":{\"type\":\"", 71, 72) {
                     Some("text") => self.block = Some(TextKind::Text),
                     Some("thinking") => self.block = Some(TextKind::Thinking),
-                    Some("tool_use" | "server_tool_use") => {
-                        self.tool_name = Some(str_field(block, "name"));
+                    Some("tool_use") | Some("server_tool_use") => {
+                        self.tool_name = Some(
+                            extract_str_after(line, b"\"name\":\"")
+                                .unwrap_or("")
+                                .to_string(),
+                        );
                         self.tool_json.clear();
                         if self.tool_io {
-                            let id = str_field(block, "id");
-                            self.tool_id = (!id.is_empty()).then_some(id);
+                            self.tool_id = extract_str_after(line, b"\"id\":\"")
+                                .filter(|s| !s.is_empty())
+                                .map(String::from);
                         }
                     }
                     _ => {}
                 }
             }
-            Some("content_block_delta") => {
-                let delta = event.get("delta").unwrap_or(&Value::Null);
-                match delta.get("type").and_then(Value::as_str) {
-                    Some("text_delta") => {
-                        self.buffer(TextKind::Text, &str_field(delta, "text"), out)
-                    }
-                    Some("thinking_delta") => {
-                        self.buffer(TextKind::Thinking, &str_field(delta, "thinking"), out)
-                    }
-                    Some("input_json_delta") => {
-                        self.tool_json.push_str(&str_field(delta, "partial_json"))
-                    }
-                    _ => {}
+            "content_block_stop" => self.end_block(out),
+            "message_start" => {
+                if let Some(input) = extract_u64_field(line, b"\"input_tokens\":") {
+                    self.input = input;
+                }
+                if let Some(cr) = extract_u64_field(line, b"\"cache_read_input_tokens\":") {
+                    self.cache_read = cr;
+                }
+                if let Some(cw) =
+                    extract_u64_field(line, b"\"cache_creation_input_tokens\":")
+                {
+                    self.cache_write = cw;
                 }
             }
-            Some("content_block_stop") => self.end_block(out),
-            Some("message_start") => {
-                let usage = event
-                    .get("message")
-                    .and_then(|m| m.get("usage"))
-                    .unwrap_or(&Value::Null);
-                self.input = u64_field(usage, "input_tokens");
-                self.cache_read = u64_field(usage, "cache_read_input_tokens");
-                self.cache_write = u64_field(usage, "cache_creation_input_tokens");
-            }
-            Some("message_delta") => {
-                let usage = event.get("usage").unwrap_or(&Value::Null);
-                let out_tokens = u64_field(usage, "output_tokens");
-                if out_tokens > 0 {
-                    self.output = out_tokens;
+            "message_delta" => {
+                if let Some(tokens) = extract_u64_field(line, b"\"output_tokens\":")
+                    && tokens > 0
+                {
+                    self.output = tokens;
                     self.maybe_emit_tokens(out);
                 }
             }
-            Some("error") => {
-                let err = event.get("error").unwrap_or(&Value::Null);
-                out.push(AgentEvent::Error {
-                    error_type: str_field(err, "type"),
-                    message: str_field(err, "message"),
-                });
+            "error" => {
+                let Some(event_str) = extract_event_json(line) else {
+                    return;
+                };
+                if let Ok(evt) = serde_json::from_str::<ErrorEvt>(event_str) {
+                    out.push(AgentEvent::Error {
+                        error_type: evt.error.error_type.into_owned(),
+                        message: evt.error.message.into_owned(),
+                    });
+                }
             }
             _ => {}
         }
@@ -234,29 +294,35 @@ impl StreamJsonParser {
     fn buffer(&mut self, kind: TextKind, chunk: &str, out: &mut Vec<AgentEvent>) {
         self.block = Some(kind);
         self.buf.push_str(chunk);
-        while let Some(i) = self.buf.find('\n') {
-            let mut line: String = self.buf.drain(..=i).collect();
-            line.pop(); // drop the trailing '\n'
-            out.push(kind.event(line));
+        let mut start = 0;
+        while let Some(pos) = self.buf[start..].find('\n') {
+            let end = start + pos;
+            out.push(kind.event(self.buf[start..end].to_string()));
+            start = end + 1;
+        }
+        if start > 0 {
+            self.buf.drain(..start);
         }
     }
 
     /// Close the open block: emit a completed tool call, or flush a text/thinking tail.
     fn end_block(&mut self, out: &mut Vec<AgentEvent>) {
         if let Some(name) = self.tool_name.take() {
-            let parsed = serde_json::from_str::<Value>(&self.tool_json).ok();
-            let summary = parsed
-                .as_ref()
-                .map(|p| format_tool(&name, p))
-                .unwrap_or_default();
             let subagent = name == "Agent" || name == "Task";
-            let input = if self.tool_io {
+            let (summary, input) = if self.tool_io {
+                let parsed = serde_json::from_str::<Value>(&self.tool_json).ok();
+                let summary = parsed
+                    .as_ref()
+                    .map(|p| format_tool(&name, p))
+                    .unwrap_or_default();
                 if let Some(id) = self.tool_id.take() {
-                    self.tool_names.insert(id, name.clone());
+                    self.tool_names.push((id, name.clone()));
                 }
-                parsed.as_ref().map(bounded_input)
+                let input = parsed.as_ref().map(bounded_input);
+                (summary, input)
             } else {
-                None
+                let summary = format_tool_fast(&name, &self.tool_json);
+                (summary, None)
             };
             out.push(AgentEvent::Tool {
                 name,
@@ -296,7 +362,9 @@ impl StreamJsonParser {
             let id = str_field(block, "tool_use_id");
             let name = self
                 .tool_names
-                .remove(&id)
+                .iter()
+                .position(|(k, _)| k == &id)
+                .map(|i| self.tool_names.swap_remove(i).1)
                 .unwrap_or_else(|| "tool".to_string());
             out.push(AgentEvent::Tool {
                 name,
@@ -343,6 +411,347 @@ impl StreamJsonParser {
                 .and_then(RateHandle::get),
             cost_usd: self.live_cost(),
         }));
+    }
+}
+
+/// Extract a simple unescaped string value following a byte pattern.
+fn extract_str_after<'a>(line: &'a str, key: &[u8]) -> Option<&'a str> {
+    let bytes = line.as_bytes();
+    let pos = bytes.windows(key.len()).position(|w| w == key)?;
+    let val_start = pos + key.len();
+    let val_end = val_start + bytes[val_start..].iter().position(|&b| b == b'"')?;
+    Some(&line[val_start..val_end])
+}
+
+/// Extract the inner event type from a stream_event line without finding event boundaries.
+/// Looks for `"event":{"type":"` which is at a fixed position in the stream_event format.
+fn inner_event_type(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    // Fixed layout: {"type":"stream_event","event":{"type":"...
+    //                                        byte 31^       ^byte 40
+    if bytes.len() > 41 && &bytes[31..40] == b"{\"type\":\"" {
+        let val_end = 40 + bytes[40..].iter().position(|&b| b == b'"')?;
+        return Some(&line[40..val_end]);
+    }
+    // Fallback: scan for the pattern
+    const NEEDLE: &[u8] = b"\"event\":{\"type\":\"";
+    let search_end = bytes.len().min(50);
+    let pos = bytes[..search_end]
+        .windows(NEEDLE.len())
+        .position(|w| w == NEEDLE)?;
+    let val_start = pos + NEEDLE.len();
+    let val_end = val_start + bytes[val_start..].iter().position(|&b| b == b'"')?;
+    Some(&line[val_start..val_end])
+}
+
+/// Extract a u64 value for a given JSON key via byte scanning.
+fn extract_u64_field(line: &str, key: &[u8]) -> Option<u64> {
+    let bytes = line.as_bytes();
+    let pos = bytes.windows(key.len()).position(|w| w == key)?;
+    let val_start = pos + key.len();
+    let mut val: u64 = 0;
+    let mut i = val_start;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        val = val * 10 + (bytes[i] - b'0') as u64;
+        i += 1;
+    }
+    if i == val_start {
+        return None;
+    }
+    Some(val)
+}
+
+/// Extract the delta type and content string from a content_block_delta event JSON.
+/// Scans for the delta type via bytes, then jumps directly to the content value
+/// using known field layout, avoiding a second scan on the hottest path.
+fn extract_delta(event: &str) -> Option<(DeltaKind, Cow<'_, str>)> {
+    let bytes = event.as_bytes();
+    const DELTA_TYPE: &[u8] = b"\"delta\":{\"type\":\"";
+    let dt_len = DELTA_TYPE.len();
+    // Fast path: index 0-9 → needle at byte 71; index 10-99 → byte 72
+    let type_start = if bytes.len() > 71 + dt_len && &bytes[71..71 + dt_len] == DELTA_TYPE {
+        71 + dt_len
+    } else if bytes.len() > 72 + dt_len && &bytes[72..72 + dt_len] == DELTA_TYPE {
+        72 + dt_len
+    } else {
+        let skip = 60.min(bytes.len());
+        let pos = skip
+            + bytes[skip..]
+                .windows(dt_len)
+                .position(|w| w == DELTA_TYPE)?;
+        pos + dt_len
+    };
+
+    let (delta_kind, value_offset) = match bytes.get(type_start)? {
+        b't' => {
+            if bytes.get(type_start + 1) == Some(&b'e') {
+                (DeltaKind::Text, 20) // text_delta","text":"
+            } else {
+                (DeltaKind::Thinking, 28) // thinking_delta","thinking":"
+            }
+        }
+        b'i' => (DeltaKind::InputJson, 34), // input_json_delta","partial_json":"
+        _ => return None,
+    };
+
+    let str_start = type_start + value_offset;
+    if str_start >= bytes.len() {
+        return None;
+    }
+
+    let mut i = str_start;
+    let mut has_escape = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if !has_escape {
+                    return Some((delta_kind, Cow::Borrowed(&event[str_start..i])));
+                }
+                let value_start = str_start - 1;
+                let mut de = serde_json::Deserializer::from_str(&event[value_start..]);
+                let value: Cow<'_, str> = serde::Deserialize::deserialize(&mut de).ok()?;
+                return Some((delta_kind, value));
+            }
+            b'\\' => {
+                has_escape = true;
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Extract the JSON object value of the `"event"` key from a stream_event line.
+/// Finds `"event":` then tracks brace nesting (respecting JSON strings) to locate
+/// the matching `}`. Returns the substring `{...}` without parsing anything.
+fn extract_event_json(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    const NEEDLE: &[u8] = b"\"event\":";
+    let search_end = bytes.len().min(40);
+    let pos = bytes[..search_end]
+        .windows(NEEDLE.len())
+        .position(|w| w == NEEDLE)?;
+    let mut i = pos + NEEDLE.len();
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'{' {
+        return None;
+    }
+    let obj_start = i;
+    let mut depth = 0u32;
+    let mut in_string = false;
+    let mut escape = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escape {
+            escape = false;
+        } else if in_string {
+            if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&line[obj_start..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Like extract_str_after but checks two hardcoded offsets first, then falls back to scan.
+fn extract_str_at_offsets<'a>(line: &'a str, needle: &[u8], off1: usize, off2: usize) -> Option<&'a str> {
+    let bytes = line.as_bytes();
+    let nlen = needle.len();
+    let val_start =
+        if bytes.len() > off1 + nlen && &bytes[off1..off1 + nlen] == needle {
+            off1 + nlen
+        } else if bytes.len() > off2 + nlen && &bytes[off2..off2 + nlen] == needle {
+            off2 + nlen
+        } else {
+            return extract_str_after(line, needle);
+        };
+    let val_end = val_start + bytes[val_start..].iter().position(|&b| b == b'"')?;
+    Some(&line[val_start..val_end])
+}
+
+/// Extract the value of the first `"type":"..."` field via byte scanning.
+/// Type values are plain ASCII identifiers, never containing escape sequences.
+fn quick_type(line: &str) -> Option<&str> {
+    const NEEDLE: &[u8] = b"\"type\":\"";
+    let bytes = line.as_bytes();
+    let search_end = bytes.len().min(80);
+    let pos = bytes[..search_end]
+        .windows(NEEDLE.len())
+        .position(|w| w == NEEDLE)?;
+    let val_start = pos + NEEDLE.len();
+    let val_end = val_start + bytes[val_start..].iter().position(|&b| b == b'"')?;
+    Some(&line[val_start..val_end])
+}
+
+/// Extract a JSON string value for a given key via byte scanning.
+/// Returns borrowed &str when no escape sequences are present; falls back to
+/// serde for escaped strings.
+fn scan_json_str<'a>(json: &'a str, key: &[u8]) -> Cow<'a, str> {
+    let bytes = json.as_bytes();
+    let Some(pos) = bytes.windows(key.len()).position(|w| w == key) else {
+        return Cow::Borrowed("");
+    };
+    let val_start = pos + key.len();
+    if val_start >= bytes.len() || bytes[val_start] != b'"' {
+        return Cow::Borrowed("");
+    }
+    let str_start = val_start + 1;
+    let mut i = str_start;
+    let mut has_escape = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if !has_escape {
+                    return Cow::Borrowed(&json[str_start..i]);
+                }
+                let mut de = serde_json::Deserializer::from_str(&json[val_start..]);
+                if let Ok(value) = serde::Deserialize::deserialize(&mut de) {
+                    return value;
+                }
+                return Cow::Borrowed("");
+            }
+            b'\\' => {
+                has_escape = true;
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Cow::Borrowed("")
+}
+
+/// Extract a JSON number value for a given key via byte scanning.
+fn scan_json_num(json: &str, key: &[u8]) -> Option<u64> {
+    let bytes = json.as_bytes();
+    let pos = bytes.windows(key.len()).position(|w| w == key)?;
+    let val_start = pos + key.len();
+    let mut val: u64 = 0;
+    let mut i = val_start;
+    let mut found = false;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        val = val * 10 + (bytes[i] - b'0') as u64;
+        found = true;
+        i += 1;
+    }
+    found.then_some(val)
+}
+
+/// Byte-scanning fast path for format_tool: extracts fields without parsing JSON.
+fn format_tool_fast(name: &str, json: &str) -> String {
+    match name {
+        "Bash" => {
+            let cmd = scan_json_str(json, b"\"command\":");
+            let desc = scan_json_str(json, b"\"description\":");
+            if desc.is_empty() {
+                format!("$ {cmd}")
+            } else {
+                format!("$ {cmd}  # {desc}")
+            }
+        }
+        "Read" => {
+            let path = scan_json_str(json, b"\"file_path\":");
+            let path = if path.is_empty() {
+                scan_json_str(json, b"\"filePath\":")
+            } else {
+                path
+            };
+            let mut s = path.into_owned();
+            if let Some(o) = scan_json_num(json, b"\"offset\":") {
+                s.push_str(&format!(" L{o}"));
+            }
+            if let Some(l) = scan_json_num(json, b"\"limit\":") {
+                s.push_str(&format!(" +{l}"));
+            }
+            s
+        }
+        "Write" => {
+            let path = scan_json_str(json, b"\"file_path\":");
+            if path.is_empty() {
+                scan_json_str(json, b"\"filePath\":").into_owned()
+            } else {
+                path.into_owned()
+            }
+        }
+        "Edit" => {
+            let path = scan_json_str(json, b"\"file_path\":");
+            let path = if path.is_empty() {
+                scan_json_str(json, b"\"filePath\":")
+            } else {
+                path
+            };
+            let old = scan_json_str(json, b"\"old_string\":");
+            let old = if old.is_empty() {
+                scan_json_str(json, b"\"oldString\":")
+            } else {
+                old
+            };
+            let first = old.lines().next().unwrap_or("");
+            let preview: String = first.chars().take(60).collect();
+            let ell = if first.chars().count() > 60 {
+                "\u{2026}"
+            } else {
+                ""
+            };
+            format!("{path}: {preview}{ell}")
+        }
+        "Agent" | "Task" => {
+            let desc = scan_json_str(json, b"\"description\":");
+            let at = scan_json_str(json, b"\"subagent_type\":");
+            let at = if at.is_empty() {
+                scan_json_str(json, b"\"subagentType\":")
+            } else {
+                at
+            };
+            if at.is_empty() {
+                desc.into_owned()
+            } else {
+                format!("[{at}] {desc}")
+            }
+        }
+        "Glob" => {
+            let pat = scan_json_str(json, b"\"pattern\":");
+            let path = scan_json_str(json, b"\"path\":");
+            let path = if path.is_empty() { Cow::Borrowed(".") } else { path };
+            format!("{pat} in {path}")
+        }
+        "Grep" => {
+            let pat = scan_json_str(json, b"\"pattern\":");
+            let path = scan_json_str(json, b"\"path\":");
+            let path = if path.is_empty() { Cow::Borrowed(".") } else { path };
+            format!("/{pat}/ in {path}")
+        }
+        "Skill" => {
+            let skill = scan_json_str(json, b"\"skill\":");
+            let args = scan_json_str(json, b"\"args\":");
+            format!("/{skill} {args}").trim().to_string()
+        }
+        _ => {
+            if let Ok(p) = serde_json::from_str::<Value>(json) {
+                format_tool(name, &p)
+            } else {
+                String::new()
+            }
+        }
     }
 }
 
