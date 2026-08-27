@@ -59,30 +59,6 @@ struct CbInfo<'a> {
 }
 
 #[derive(Deserialize)]
-struct MsgStartEvent {
-    message: MsgUsageWrap,
-}
-
-#[derive(Deserialize)]
-struct MsgUsageWrap {
-    #[serde(default)]
-    usage: UsageFields,
-}
-
-#[derive(Deserialize, Default)]
-struct UsageFields {
-    #[serde(default)]
-    input_tokens: u64,
-    #[serde(default)]
-    cache_creation_input_tokens: u64,
-    #[serde(default)]
-    cache_read_input_tokens: u64,
-    #[allow(dead_code)]
-    #[serde(default)]
-    output_tokens: u64,
-}
-
-#[derive(Deserialize)]
 struct ErrorEvt<'a> {
     #[serde(borrow)]
     error: ErrInfo<'a>,
@@ -276,17 +252,22 @@ impl StreamJsonParser {
             }
             "content_block_stop" => self.end_block(out),
             "message_start" => {
-                let Some(event_str) = extract_event_json(line) else {
-                    return;
-                };
-                if let Ok(evt) = serde_json::from_str::<MsgStartEvent>(event_str) {
-                    self.input = evt.message.usage.input_tokens;
-                    self.cache_read = evt.message.usage.cache_read_input_tokens;
-                    self.cache_write = evt.message.usage.cache_creation_input_tokens;
+                if let Some(input) = extract_u64_field(line, b"\"input_tokens\":") {
+                    self.input = input;
+                }
+                if let Some(cr) = extract_u64_field(line, b"\"cache_read_input_tokens\":") {
+                    self.cache_read = cr;
+                }
+                if let Some(cw) =
+                    extract_u64_field(line, b"\"cache_creation_input_tokens\":")
+                {
+                    self.cache_write = cw;
                 }
             }
             "message_delta" => {
-                if let Some(tokens) = extract_output_tokens(line) {
+                if let Some(tokens) = extract_u64_field(line, b"\"output_tokens\":")
+                    && tokens > 0
+                {
                     self.output = tokens;
                     self.maybe_emit_tokens(out);
                 }
@@ -457,24 +438,21 @@ fn inner_event_type(line: &str) -> Option<&str> {
     Some(&line[val_start..val_end])
 }
 
-/// Extract output_tokens from a message_delta line via byte scanning.
-fn extract_output_tokens(line: &str) -> Option<u64> {
-    const NEEDLE: &[u8] = b"\"output_tokens\":";
+/// Extract a u64 value for a given JSON key via byte scanning.
+fn extract_u64_field(line: &str, key: &[u8]) -> Option<u64> {
     let bytes = line.as_bytes();
-    let pos = bytes
-        .windows(NEEDLE.len())
-        .position(|w| w == NEEDLE)?;
-    let val_start = pos + NEEDLE.len();
-    let val_end = val_start
-        + bytes[val_start..]
-            .iter()
-            .position(|b| !b.is_ascii_digit())?;
-    if val_start == val_end {
+    let pos = bytes.windows(key.len()).position(|w| w == key)?;
+    let val_start = pos + key.len();
+    let mut val: u64 = 0;
+    let mut i = val_start;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        val = val * 10 + (bytes[i] - b'0') as u64;
+        i += 1;
+    }
+    if i == val_start {
         return None;
     }
-    // Safe: we verified all bytes are ASCII digits
-    let s = &line[val_start..val_end];
-    s.parse().ok().filter(|&v: &u64| v > 0)
+    Some(val)
 }
 
 /// Extract the delta type and content string from a content_block_delta event JSON.
