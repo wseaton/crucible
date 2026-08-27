@@ -174,7 +174,9 @@ impl StreamJsonParser {
                 }
             }
             Some("user") => {
-                if let Ok(msg) = serde_json::from_str::<Value>(line) {
+                if self.tool_io
+                    && let Ok(msg) = serde_json::from_str::<Value>(line)
+                {
                     self.tool_results(&msg, out);
                 }
             }
